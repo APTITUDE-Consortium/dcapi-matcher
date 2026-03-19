@@ -1,5 +1,4 @@
 {
-  "result": "error",
-  "error": "InvalidQuery",
-  "message": "claims missing id: pid"
+    "result": "error",
+    "error": "Unsatisfied"
 }

@@ -1,5 +1,17 @@
 {
-  "result": "error",
-  "error": "InvalidQuery",
-  "message": "empty claim path: pid"
+  "result": "plan",
+  "presentation_sets": [
+    [
+      {
+        "transaction_data_ids": [],
+        "alternatives": [
+          {
+            "dcql_id": "pid",
+            "credential_id": "sd1",
+            "selected_claim_ids": []
+          }
+        ]
+      }
+    ]
+  ]
 }

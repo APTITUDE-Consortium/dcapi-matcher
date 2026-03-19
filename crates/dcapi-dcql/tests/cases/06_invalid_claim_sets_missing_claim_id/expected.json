@@ -1,4 +1,4 @@
 {
-  "result": "parse_error",
-  "message": "claims missing id: pid"
+    "result": "error",
+    "error": "Unsatisfied"
 }

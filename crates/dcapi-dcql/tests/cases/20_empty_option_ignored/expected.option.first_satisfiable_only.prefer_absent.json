@@ -1,5 +1,17 @@
 {
-  "result": "error",
-  "error": "InvalidQuery",
-  "message": "dcql_query.credential_sets[].options[] must be non-empty"
+  "result": "plan",
+  "presentation_sets": [
+    [
+      {
+        "transaction_data_ids": [],
+        "alternatives": [
+          {
+            "dcql_id": "a",
+            "credential_id": "sd_a",
+            "selected_claim_ids": []
+          }
+        ]
+      }
+    ]
+  ]
 }

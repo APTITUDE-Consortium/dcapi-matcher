@@ -713,21 +713,17 @@ where
 }
 
 fn map_claims_by_id<'a>(
-    query_id: &str,
+    _query_id: &str,
     claims: &'a [ClaimsQuery],
 ) -> Result<BTreeMap<String, &'a ClaimsQuery>, PlanError> {
     let mut map = BTreeMap::new();
     for claim in claims {
         let Some(id) = claim.id() else {
-            return Err(PlanError::InvalidQuery(format!(
-                "claims missing id: {query_id}"
-            )));
+            // Skip claims without an id — claim_sets cannot reference them.
+            continue;
         };
-        if map.insert(id.to_string(), claim).is_some() {
-            return Err(PlanError::InvalidQuery(format!(
-                "duplicate claim id: {query_id}.{id}"
-            )));
-        }
+        // First occurrence wins; duplicates are silently ignored.
+        map.entry(id.to_string()).or_insert(claim);
     }
     Ok(map)
 }
@@ -752,6 +748,9 @@ fn dedupe_claims_by_path(claims: &[ClaimsQuery]) -> Vec<ClaimsQuery> {
     let mut seen_paths = FxHashSet::default();
     let mut out = Vec::new();
     for claim in claims {
+        if claim.path.is_empty() {
+            continue;
+        }
         if seen_paths.insert(claim.path.clone()) {
             out.push(claim.clone());
         }
@@ -914,6 +913,9 @@ where
 {
     let mut out = Vec::new();
     for option in &set.options {
+        if option.is_empty() {
+            continue;
+        }
         let feasible = option.iter().all(|id| {
             matches_by_id
                 .get(id)
