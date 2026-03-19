@@ -151,7 +151,15 @@ where
     let mut matches_by_id = BTreeMap::new();
     let mut query_by_id = BTreeMap::new();
     for credential_query in &query.credentials {
-        let matches = match_query(store, credential_query)?;
+        let matches = match match_query(store, credential_query) {
+            Ok(m) => m,
+            Err(PlanError::InvalidQuery(_)) if credential_query.format() == CredentialFormat::Unknown => {
+                // Skip credentials with unsupported formats so that
+                // credential-set options referencing them are simply pruned.
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         let query_id = credential_query
             .id()
             .ok_or_else(|| {
@@ -831,6 +839,9 @@ where
     let Some(credential_sets) = &query.credential_sets else {
         let mut all = Config::new();
         for credential_query in &query.credentials {
+            if credential_query.format() == CredentialFormat::Unknown {
+                continue;
+            }
             let query_id = credential_query
                 .id()
                 .ok_or_else(|| {
@@ -846,6 +857,9 @@ where
                 return Err(PlanError::Unsatisfied);
             }
             all.insert(query_id.to_owned());
+        }
+        if all.is_empty() {
+            return Err(PlanError::Unsatisfied);
         }
         return Ok(vec![all]);
     };

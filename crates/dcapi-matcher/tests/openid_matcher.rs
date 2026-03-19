@@ -1190,6 +1190,85 @@ struct DemoPackage {
 }
 
 #[test]
+fn openid4vp_zk_format_falls_back_to_non_zk_option() {
+    let store = TestStore::new(vec![TestCredential {
+        id: c8string("age-mdoc-1"),
+        title: c8string("Age Credential"),
+        format: CredentialFormat::MsoMdoc,
+        protocols: HashSet::from(["openid4vp-v1-unsigned".to_string()]),
+        vcts: vec![],
+        doctype: Some("eu.europa.ec.av.1".to_string()),
+        holder_binding: true,
+        claims: json!({"eu.europa.ec.av.1": {"age_over_18": true}}),
+        transaction_data_types: vec![],
+        ts12_metadata: vec![],
+    }]);
+
+    let request = json!({
+        "requests": [{
+            "protocol": PROTOCOL_OPENID4VP_V1_UNSIGNED,
+            "data": {
+                "nonce": "test-nonce",
+                "dcql_query": {
+                    "credential_sets": [
+                        {
+                            "options": [["age_credential_zk"], ["age_credential_mdoc"]],
+                            "purpose": "Age verification"
+                        }
+                    ],
+                    "credentials": [
+                        {
+                            "id": "age_credential_zk",
+                            "format": "mso_mdoc_zk",
+                            "meta": {
+                                "doctype_value": "eu.europa.ec.av.1",
+                                "zk_system_type": [{
+                                    "system": "longfellow-libzk-v1",
+                                    "circuit_hash": "137e5a75ce72735a37c8a72da1a8a0a5df8d13365c2ae3d2c2bd6a0e7197c7c6",
+                                    "num_attributes": 1,
+                                    "version": 6,
+                                    "block_enc_hash": 4096,
+                                    "block_enc_sig": 2945
+                                }]
+                            },
+                            "claims": [
+                                { "path": ["eu.europa.ec.av.1", "age_over_18"] }
+                            ]
+                        },
+                        {
+                            "id": "age_credential_mdoc",
+                            "format": "mso_mdoc",
+                            "meta": {
+                                "doctype_value": "eu.europa.ec.av.1"
+                            },
+                            "claims": [
+                                { "path": ["eu.europa.ec.av.1", "age_over_18"] }
+                            ]
+                        }
+                    ]
+                }
+            }
+        }]
+    })
+    .to_string();
+
+    let response = match_dc_api_request(&request, &store, &MatcherOptions::default()).unwrap();
+    assert_eq!(response.results.len(), 1, "expected exactly one result group");
+
+    let MatcherResult::Group(set) = &response.results[0] else {
+        panic!("expected group");
+    };
+    assert_eq!(set.slots.len(), 1, "expected one slot");
+
+    let alt_ids: Vec<_> = set.slots[0]
+        .alternatives
+        .iter()
+        .filter_map(|entry| entry_cred_id(entry).to_str().ok())
+        .collect();
+    assert_eq!(alt_ids, vec!["age-mdoc-1"], "only the non-zk mdoc credential should match");
+}
+
+#[test]
 fn decode_helpers_support_json_packages() {
     let package = DemoPackage {
         version: 1,

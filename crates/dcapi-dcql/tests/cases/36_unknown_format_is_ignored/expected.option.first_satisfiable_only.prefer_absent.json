@@ -1,5 +1,17 @@
 {
-  "result": "error",
-  "error": "InvalidQuery",
-  "message": "unsupported credential format in dcql_query.credentials entry"
+  "result": "plan",
+  "presentation_sets": [
+    [
+      {
+        "transaction_data_ids": [],
+        "alternatives": [
+          {
+            "dcql_id": "known",
+            "credential_id": "cred-known",
+            "selected_claim_ids": []
+          }
+        ]
+      }
+    ]
+  ]
 }
