@@ -403,7 +403,6 @@ where
             presentation_set,
             transaction_data.as_deref().unwrap_or_default(),
             protocol,
-            options,
         )?;
         response = response.add_group(set);
     }
@@ -417,7 +416,6 @@ fn set_from_dcql_presentation_set<'s, 't, S>(
     presentation_set: &'t [SetAlternative<S::CredentialRef>],
     transaction_data: &'t [TransactionData],
     protocol: &str,
-    options: &MatcherOptions,
 ) -> Result<CredentialSet<'s>, MatcherError>
 where
     S: MatcherStore,
@@ -435,7 +433,6 @@ where
                     set_index,
                     slot_index,
                     selection.dcql_id.as_str(),
-                    selection.transaction_data_ids.as_slice(),
                 )?);
                 continue;
             };
@@ -443,14 +440,12 @@ where
                 continue;
             }
             let context = DcqlSelectionContext {
-                request_index,
-                alternative_index: set_index,
                 query_id: selection.dcql_id.as_str(),
                 selected_claims: selection.selected_claims.as_slice(),
                 transaction_data,
                 transaction_data_indices: selection.transaction_data_ids.as_slice(),
             };
-            match build_entry(store, cred, &context, options) {
+            match build_entry(store, cred, &context) {
                 Ok(entry) => alternatives.push(entry),
                 Err(err) => err.error(),
             }
@@ -471,14 +466,13 @@ fn build_none_entry<'s>(
     set_index: usize,
     slot_index: usize,
     dcql_id: &str,
-    transaction_data_indices: &[usize],
 ) -> Result<CredentialEntry<'s>, MatcherError> {
     let cred_id = cow_cstr_from_c8string(c8format!(
         "__none__:{request_index}:{set_index}:{slot_index}"
     ));
     let title = cow_cstr_from_bytes("No credential");
     let mut entry = StringIdEntry::new_cow(cred_id, title);
-    entry.metadata = build_metadata(dcql_id, "__none__", transaction_data_indices)?;
+    entry.metadata = build_metadata(dcql_id, "__none__", None)?;
     entry.fields = Cow::Owned(vec![Field::from_cow(
         cow_cstr_from_bytes("No credential will be presented"),
         None,
@@ -503,7 +497,6 @@ fn build_entry<'s, 'c, S>(
     store: &'s S,
     cred: &S::CredentialRef,
     context: &DcqlSelectionContext<'c>,
-    _options: &MatcherOptions,
 ) -> Result<CredentialEntry<'s>, MatcherError>
 where
     S: MatcherStore + ?Sized,
@@ -514,27 +507,17 @@ where
     let subtitle = store.credential_subtitle(cred);
     let disclaimer = store.credential_disclaimer(cred);
     let warning = store.credential_warning(cred);
-    let ts12_display = ts12::build_display_for_context(
-        store,
-        cred,
-        credential_id.as_ref(),
-        context,
-        store.locales(),
-    )?;
-    let (ts12_fields, payment_summary) = match ts12_display {
-        Some(display) => (display.transaction_fields, display.payment_summary),
-        None => (Vec::new(), None),
+    let ts12_display =
+        ts12::build_display_for_context(store, cred, credential_id.as_ref(), context)?;
+    let (payment_summary, displayed_transaction_data_index) = match ts12_display {
+        Some(display) => (
+            Some(display.payment_summary),
+            Some(display.displayed_transaction_data_index),
+        ),
+        None => (None, None),
     };
 
-    let mut fields = ts12_fields
-        .into_iter()
-        .map(|field| {
-            Field::from_cow(
-                cow_cstr_from_cow(field.display_name),
-                Some(cow_cstr_from_cow(field.display_value)),
-            )
-        })
-        .collect::<Vec<_>>();
+    let mut fields = Vec::new();
     for claim in context.selected_claims {
         if claim
             .path
@@ -552,11 +535,15 @@ where
             value.map(cow_cstr_from_cow),
         ));
     }
-    let metadata = build_metadata(
-        context.query_id,
-        credential_id.as_str(),
-        context.transaction_data_indices,
-    )?;
+    let transaction_data =
+        context
+            .transaction_data_indices
+            .first()
+            .map(|idx| SelectedTransactionData {
+                index: *idx,
+                displayed: displayed_transaction_data_index == Some(*idx),
+            });
+    let metadata = build_metadata(context.query_id, credential_id.as_str(), transaction_data)?;
 
     let credential_id = cow_cstr_from_cow(credential_id);
     let title = cow_cstr_from_cow(title);
@@ -593,7 +580,7 @@ where
 fn build_metadata<'a>(
     dcql_id: &str,
     credential_id: &str,
-    transaction_data_indices: &[usize],
+    transaction_data: Option<SelectedTransactionData>,
 ) -> Result<Option<Cow<'a, CStr>>, MatcherError> {
     let mut obj = serde_json::Map::new();
     obj.insert("dcql_id".to_string(), Value::String(dcql_id.to_string()));
@@ -601,19 +588,34 @@ fn build_metadata<'a>(
         "credential_id".to_string(),
         Value::String(credential_id.to_string()),
     );
-    obj.insert(
-        "transaction_data_indices".to_string(),
-        Value::Array(
-            transaction_data_indices
-                .iter()
-                .map(|idx| Value::from(*idx as u64))
-                .collect(),
-        ),
-    );
+    if let Some(transaction_data) = transaction_data {
+        obj.insert("transaction_data".to_string(), transaction_data.into());
+    }
     let value = Value::Object(obj);
     let bytes = serde_json::to_vec(&value)
         .map_err(|err| MatcherError::MetadataSerialization { source: err })?;
     Ok(Some(cow_cstr_from_bytes(bytes)))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SelectedTransactionData {
+    index: usize,
+    displayed: bool,
+}
+
+impl From<SelectedTransactionData> for Value {
+    fn from(transaction_data: SelectedTransactionData) -> Self {
+        let mut obj = serde_json::Map::new();
+        obj.insert(
+            "index".to_string(),
+            Value::from(transaction_data.index as u64),
+        );
+        obj.insert(
+            "displayed".to_string(),
+            Value::Bool(transaction_data.displayed),
+        );
+        Value::Object(obj)
+    }
 }
 
 fn set_id_for_dcql(protocol: &str, request_index: usize, alternative_index: usize) -> C8String {

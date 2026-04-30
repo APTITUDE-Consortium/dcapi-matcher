@@ -1,7 +1,6 @@
 use crate::models::Ts12DataType;
 use alloc::string::String;
 use core::error::Error as CoreError;
-use dcapi_dcql::ClaimsPathPointer;
 use thiserror::Error;
 
 /// TS12-specific request/configuration warnings.
@@ -28,7 +27,7 @@ pub enum Ts12MetadataError {
         credential_id: String,
         data_type: Ts12DataType,
     },
-    /// Transaction data metadata does not match the requested type/subtype.
+    /// Transaction data metadata does not match the requested type.
     #[error(
         "credential {credential_id} ts12 metadata type mismatch (expected {expected:?}, got {actual:?})"
     )]
@@ -36,60 +35,6 @@ pub enum Ts12MetadataError {
         credential_id: String,
         expected: Ts12DataType,
         actual: Ts12DataType,
-    },
-    /// Missing claim metadata for a payload path.
-    #[error(
-        "credential {credential_id} ts12 metadata for {data_type:?} missing claim metadata for path {path:?}"
-    )]
-    MissingClaimMetadata {
-        credential_id: String,
-        data_type: Ts12DataType,
-        path: ClaimsPathPointer,
-    },
-    /// Missing localized label for a claim.
-    #[error(
-        "credential {credential_id} ts12 metadata for {data_type:?} missing label for locale {locale} at path {path:?}"
-    )]
-    MissingClaimLabel {
-        credential_id: String,
-        data_type: Ts12DataType,
-        locale: String,
-        path: ClaimsPathPointer,
-    },
-    /// Empty localized label for a claim.
-    #[error(
-        "credential {credential_id} ts12 metadata for {data_type:?} empty label for locale {locale} at path {path:?}"
-    )]
-    EmptyClaimLabel {
-        credential_id: String,
-        data_type: Ts12DataType,
-        locale: String,
-        path: ClaimsPathPointer,
-    },
-    /// UI labels catalogue missing a required key.
-    #[error("credential {credential_id} ts12 metadata for {data_type:?} ui_labels missing {label}")]
-    MissingUiLabels {
-        credential_id: String,
-        data_type: Ts12DataType,
-        label: &'static str,
-    },
-    /// UI labels catalogue missing a localized value for a required key.
-    #[error(
-        "credential {credential_id} ts12 metadata for {data_type:?} ui_labels missing localized {label} for locale {locale}"
-    )]
-    MissingLocalizedUiLabel {
-        credential_id: String,
-        data_type: Ts12DataType,
-        label: &'static str,
-        locale: String,
-    },
-    /// Preferred locales are required for TS12 display.
-    #[error(
-        "credential {credential_id} ts12 metadata for {data_type:?} requires preferred locales"
-    )]
-    MissingPreferredLocales {
-        credential_id: String,
-        data_type: Ts12DataType,
     },
 }
 

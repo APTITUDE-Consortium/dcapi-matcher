@@ -27,10 +27,7 @@ pub use error::{
 };
 pub use models::*;
 pub use traits::*;
-pub use ts12::{
-    Ts12ClaimMetadata, Ts12LocalizedLabel, Ts12LocalizedValue, Ts12PaymentSummary,
-    Ts12TransactionMetadata, Ts12UiLabels,
-};
+pub use ts12::{Ts12ClaimMetadata, Ts12PaymentSummary, Ts12TransactionMetadata};
 
 use crate::diagnostics::ErrorExt;
 use serde::de::DeserializeOwned;

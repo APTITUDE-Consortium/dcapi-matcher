@@ -1,6 +1,6 @@
 use crate::config::OpenId4VpConfig;
 use crate::diagnostics::LogLevel;
-use crate::models::{OpenId4VpSignedEnvelope, PROTOCOL_OPENID4VP};
+use crate::models::OpenId4VpSignedEnvelope;
 use crate::ts12::{Ts12PaymentSummary, Ts12TransactionMetadata};
 use alloc::borrow::Cow;
 use c8str::C8Str;
@@ -10,10 +10,6 @@ use serde_json::Value;
 /// Context passed when building Credman metadata for one candidate entry.
 #[derive(Debug)]
 pub struct DcqlSelectionContext<'a> {
-    /// Request index in `DcApiRequest.requests`.
-    pub request_index: usize,
-    /// Alternative index in planned DCQL output.
-    pub alternative_index: usize,
     /// DCQL credential query id.
     pub query_id: &'a str,
     /// Claim constraints selected for this query.
@@ -22,13 +18,6 @@ pub struct DcqlSelectionContext<'a> {
     pub transaction_data: &'a [dcapi_dcql::TransactionData],
     /// Transaction data indices bound to this query id in the selected alternative.
     pub transaction_data_indices: &'a [usize],
-}
-
-impl DcqlSelectionContext<'_> {
-    /// Returns a protocol label for metadata serialization.
-    pub fn protocol(&self) -> &'static str {
-        PROTOCOL_OPENID4VP
-    }
 }
 
 /// Store contract used by `dcapi-matcher`.
@@ -106,25 +95,22 @@ pub trait MatcherStore: CredentialStore {
         OpenId4VpConfig::default()
     }
 
-    /// Locales (RFC5646 identifiers) for UI rendering, in priority order.
-    fn locales(&self) -> &[&str];
-
     /// Logging level for matcher diagnostics. `None` disables logging.
     fn log_level(&self) -> Option<LogLevel> {
         None
     }
 
-    /// Returns resolved TS12 transaction metadata for display and rendering.
+    /// Returns resolved TS12 transaction metadata for payload compatibility.
     ///
-    /// Implementers must resolve any `claims_uri` / `ui_labels_uri` references and apply
+    /// Implementers must resolve any `claims_uri` references and apply
     /// `extends` merging rules before returning this metadata. The returned metadata must
-    /// already contain the matching `type`/`subtype`. Return `None` when the credential does not
+    /// already contain the matching `type`. Return `None` when the credential does not
     /// support the provided transaction data type.
-    fn ts12_transaction_metadata<'a>(
-        &'a self,
+    fn ts12_transaction_metadata(
+        &self,
         _cred: &Self::CredentialRef,
         _transaction_data: &dcapi_dcql::TransactionData,
-    ) -> Option<Ts12TransactionMetadata<'a>> {
+    ) -> Option<Ts12TransactionMetadata> {
         None
     }
 
@@ -138,25 +124,8 @@ pub trait MatcherStore: CredentialStore {
         _cred: &Self::CredentialRef,
         _transaction_data: &dcapi_dcql::TransactionData,
         _payload: &Value,
-        _metadata: &Ts12TransactionMetadata<'a>,
-        _locale: &str,
+        _metadata: &Ts12TransactionMetadata,
     ) -> Option<Ts12PaymentSummary<'a>> {
-        None
-    }
-
-    /// Optional formatter for TS12 transaction data values.
-    ///
-    /// This hook lets wallets provide localized or domain-specific value rendering
-    /// (for example, translating recurrence frequency codes) without hardcoded strings
-    /// in the matcher core. When `None` is returned, the matcher falls back to
-    /// a basic string representation of the JSON value.
-    fn format_ts12_value<'a>(
-        &'a self,
-        _cred: &Self::CredentialRef,
-        _path: &ClaimsPathPointer,
-        _value: &Value,
-        _locale: &str,
-    ) -> Option<Cow<'a, C8Str>> {
         None
     }
 }

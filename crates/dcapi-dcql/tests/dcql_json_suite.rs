@@ -184,15 +184,15 @@ impl CredentialStore for JsonStore {
             return ValueMatch::NoMatch;
         };
 
-        nodes
-            .iter()
-            .any(|node| {
-                expected_values
-                    .iter()
-                    .any(|value| claim_value_matches_json(value, node))
-            })
-            .then_some(ValueMatch::Match)
-            .unwrap_or(ValueMatch::NoMatch)
+        if nodes.iter().any(|node| {
+            expected_values
+                .iter()
+                .any(|value| claim_value_matches_json(value, node))
+        }) {
+            ValueMatch::Match
+        } else {
+            ValueMatch::NoMatch
+        }
     }
 
     fn matches_trusted_authorities(

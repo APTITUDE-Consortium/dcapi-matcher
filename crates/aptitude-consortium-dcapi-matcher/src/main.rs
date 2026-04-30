@@ -3,13 +3,12 @@ use base64::Engine;
 use c8str::{C8Str, C8String, c8, c8format};
 use dcapi_dcql::{
     ClaimValue, ClaimsPathPointer, CredentialFormat, CredentialStore, PathElement, PlanOptions,
-    TransactionData, TransactionDataType, ValueMatch, path_matches,
+    TransactionData, ValueMatch, path_matches, select_nodes,
 };
 use dcapi_matcher::diagnostics::info;
 use dcapi_matcher::{
     LogLevel, MatcherOptions, MatcherStore, OpenId4VpConfig, Ts12ClaimMetadata, Ts12DataType,
-    Ts12LocalizedLabel, Ts12LocalizedValue, Ts12PaymentSummary, Ts12TransactionMetadata,
-    Ts12UiLabels, dcapi_matcher, match_dc_api_request,
+    Ts12PaymentSummary, Ts12TransactionMetadata, dcapi_matcher, match_dc_api_request,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -18,14 +17,6 @@ use std::borrow::Cow;
 #[repr(transparent)]
 #[derive(Debug, Clone)]
 struct C8StringValue(C8String);
-
-impl core::ops::Deref for C8StringValue {
-    type Target = C8Str;
-
-    fn deref(&self) -> &Self::Target {
-        self.0.as_c8_str()
-    }
-}
 
 impl From<C8StringValue> for C8String {
     fn from(value: C8StringValue) -> Self {
@@ -52,9 +43,21 @@ struct PackageConfig {
     openid4vp: OpenId4VpConfig,
     #[serde(default)]
     dcql: PlanOptions,
+    #[serde(default, deserialize_with = "deserialize_payment_sca_mappings")]
+    payment_sca: Vec<PaymentScaTypeConfig>,
     log_level: Option<LogLevel>,
     #[serde(default)]
     credentials: Vec<CredentialConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PaymentScaTypeConfig {
+    #[serde(rename = "type")]
+    data_type: String,
+    payee: ClaimsPathPointer,
+    amount: ClaimsPathPointer,
+    #[serde(default)]
+    additional_info: Option<ClaimsPathPointer>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -79,7 +82,7 @@ struct CredentialConfig {
     doctype: Option<String>,
     holder_binding: Option<bool>,
     claims: Option<Value>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_ts12_metadata_configs")]
     transaction_data_types: Vec<Ts12MetadataConfig>,
 }
 
@@ -93,40 +96,25 @@ struct CredentialFieldConfig {
 
 #[derive(Debug, Deserialize)]
 struct Ts12MetadataConfig {
-    #[serde(flatten)]
-    data_type: Ts12DataType,
-    #[serde(default)]
+    #[serde(rename = "type")]
+    data_type: String,
+    #[serde(default, deserialize_with = "deserialize_ts12_claim_configs")]
     claims: Vec<Ts12ClaimConfig>,
-    #[serde(default)]
-    ui_labels: Vec<Ts12UiLabelConfig>,
 }
 
 #[derive(Debug, Deserialize)]
 struct Ts12ClaimConfig {
     path: ClaimsPathPointer,
     #[serde(default)]
-    display: Vec<Ts12LocalizedLabelConfig>,
-}
-
-#[derive(Debug, Deserialize)]
-struct Ts12LocalizedLabelConfig {
-    locale: String,
-    label: C8StringValue,
+    mandatory: bool,
     #[serde(default)]
-    description: Option<C8StringValue>,
-}
-
-#[derive(Debug, Deserialize)]
-struct Ts12UiLabelConfig {
-    key: String,
-    #[serde(default)]
-    values: Vec<Ts12LocalizedValueConfig>,
-}
-
-#[derive(Debug, Deserialize)]
-struct Ts12LocalizedValueConfig {
-    locale: String,
-    value: C8StringValue,
+    value_type: Option<String>,
+    #[serde(
+        default,
+        rename = "display",
+        deserialize_with = "deserialize_displayable_claim"
+    )]
+    displayable: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -151,8 +139,7 @@ struct ResolvedCredential {
     doctype: Option<String>,
     holder_binding: bool,
     claims: Value,
-    transaction_data_types: Vec<TransactionDataType>,
-    ts12_metadata: Vec<ResolvedTs12Metadata>,
+    ts12_metadata: Vec<Ts12TransactionMetadata>,
 }
 
 #[derive(Debug, Clone)]
@@ -163,80 +150,10 @@ struct ResolvedFieldConfig {
 }
 
 #[derive(Debug, Clone)]
-struct ResolvedTs12Metadata {
-    data_type: Ts12DataType,
-    claims: Vec<ResolvedTs12ClaimMetadata>,
-    ui_labels: ResolvedTs12UiLabels,
-}
-
-#[derive(Debug, Clone)]
-struct ResolvedTs12ClaimMetadata {
-    path: ClaimsPathPointer,
-    display: Vec<ResolvedTs12LocalizedLabel>,
-}
-
-#[derive(Debug, Clone)]
-struct ResolvedTs12LocalizedLabel {
-    locale: String,
-    label: C8String,
-    description: Option<C8String>,
-}
-
-#[derive(Debug, Clone)]
-struct ResolvedTs12LocalizedValue {
-    locale: String,
-    value: C8String,
-}
-
-type ResolvedTs12UiLabels = Vec<(String, Vec<ResolvedTs12LocalizedValue>)>;
-
-impl ResolvedTs12Metadata {
-    fn as_borrowed(&self) -> Ts12TransactionMetadata<'_> {
-        let claims = self
-            .claims
-            .iter()
-            .map(|claim| Ts12ClaimMetadata {
-                path: claim.path.clone(),
-                display: claim
-                    .display
-                    .iter()
-                    .map(|label| Ts12LocalizedLabel {
-                        locale: label.locale.clone(),
-                        label: Cow::Borrowed(label.label.as_c8_str()),
-                        description: label
-                            .description
-                            .as_ref()
-                            .map(|value| Cow::Borrowed(value.as_c8_str())),
-                    })
-                    .collect(),
-            })
-            .collect();
-        let ui_labels: Ts12UiLabels<'_> = self
-            .ui_labels
-            .iter()
-            .map(|(key, values)| {
-                let values = values
-                    .iter()
-                    .map(|value| Ts12LocalizedValue {
-                        locale: value.locale.clone(),
-                        value: Cow::Borrowed(value.value.as_c8_str()),
-                    })
-                    .collect();
-                (key.clone(), values)
-            })
-            .collect();
-        Ts12TransactionMetadata {
-            data_type: self.data_type.clone(),
-            claims,
-            ui_labels,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
 struct PackageStore {
     credentials: Vec<ResolvedCredential>,
     openid4vp: OpenId4VpConfig,
+    payment_sca: Vec<PaymentScaTypeConfig>,
     log_level: Option<LogLevel>,
     dcql: PlanOptions,
 }
@@ -264,6 +181,7 @@ impl PackageStore {
         Ok(Self {
             credentials,
             openid4vp: config.openid4vp,
+            payment_sca: config.payment_sca,
             log_level: config.log_level,
             dcql: config.dcql,
         })
@@ -275,6 +193,30 @@ impl PackageStore {
 
     fn dcql_options(&self) -> PlanOptions {
         self.dcql.clone()
+    }
+
+    fn payment_sca_summary(
+        &self,
+        transaction_data: &TransactionData,
+    ) -> Option<(C8String, C8String, Option<C8String>)> {
+        let mapping = self
+            .payment_sca
+            .iter()
+            .find(|mapping| mapping.data_type == transaction_data.r#type)?;
+        let data = transaction_data_as_value(transaction_data);
+        let merchant = string_at_path(&data, &mapping.payee)?;
+        let amount = string_at_path(&data, &mapping.amount)?;
+        let additional_info = mapping
+            .additional_info
+            .as_ref()
+            .and_then(|path| string_at_path(&data, path))
+            .and_then(|value| c8string_from_str(&value));
+
+        Some((
+            c8string_from_str(&merchant)?,
+            c8string_from_str(&amount)?,
+            additional_info,
+        ))
     }
 }
 
@@ -331,28 +273,17 @@ impl CredentialStore for PackageStore {
         let Some(credential) = self.get(*cred) else {
             return false;
         };
-        if !credential
-            .transaction_data_types
+        let Some(metadata) = credential
+            .ts12_metadata
             .iter()
-            .any(|entry| entry.r#type == transaction_data.r#type)
-        {
-            return false;
-        }
-
-        let requires_subtype = credential.ts12_metadata.iter().any(|meta| {
-            meta.data_type.r#type == transaction_data.r#type && meta.data_type.subtype.is_some()
-        });
-        if !requires_subtype {
-            return true;
-        }
-
-        let Some(subtype) = transaction_data_subtype(transaction_data) else {
+            .find(|entry| entry.data_type.r#type == transaction_data.r#type)
+        else {
             return false;
         };
-        credential.ts12_metadata.iter().any(|meta| {
-            meta.data_type.r#type == transaction_data.r#type
-                && meta.data_type.subtype.as_deref() == Some(subtype)
-        })
+        let Some(payload) = transaction_data_payload(transaction_data) else {
+            return false;
+        };
+        metadata.is_payload_compatible(payload)
     }
 
     fn has_claim_path(&self, cred: &Self::CredentialRef, path: &ClaimsPathPointer) -> bool {
@@ -491,27 +422,21 @@ impl MatcherStore for PackageStore {
         self.openid4vp.clone()
     }
 
-    fn locales(&self) -> &[&str] {
-        static LOCALES: [&str; 1] = ["en"];
-        &LOCALES
-    }
-
     fn log_level(&self) -> Option<LogLevel> {
         self.log_level
     }
 
-    fn ts12_transaction_metadata<'a>(
-        &'a self,
+    fn ts12_transaction_metadata(
+        &self,
         cred: &Self::CredentialRef,
         transaction_data: &dcapi_dcql::TransactionData,
-    ) -> Option<Ts12TransactionMetadata<'a>> {
-        let data_type = ts12_data_type_from_transaction_data(transaction_data);
+    ) -> Option<Ts12TransactionMetadata> {
         self.get(*cred).and_then(|credential| {
             credential
                 .ts12_metadata
                 .iter()
-                .find(|entry| entry.data_type == data_type)
-                .map(ResolvedTs12Metadata::as_borrowed)
+                .find(|entry| entry.data_type.r#type == transaction_data.r#type)
+                .cloned()
         })
     }
 
@@ -519,56 +444,17 @@ impl MatcherStore for PackageStore {
         &'a self,
         _cred: &Self::CredentialRef,
         transaction_data: &dcapi_dcql::TransactionData,
-        payload: &Value,
-        _metadata: &Ts12TransactionMetadata<'a>,
-        _locale: &str,
+        _payload: &Value,
+        _metadata: &Ts12TransactionMetadata,
     ) -> Option<Ts12PaymentSummary<'a>> {
-        if transaction_data.r#type != "urn:eudi:sca:payment:1" {
-            return None;
-        }
+        let (merchant, amount, additional_info) = self.payment_sca_summary(transaction_data)?;
 
-        let (merchant, amount) = payment_summary_fields(payload);
         Some(Ts12PaymentSummary {
             merchant_name: Cow::Owned(merchant),
             transaction_amount: Cow::Owned(amount),
-            additional_info: None,
+            additional_info: additional_info.map(Cow::Owned),
         })
     }
-}
-
-fn payment_summary_fields(payload: &Value) -> (C8String, C8String) {
-    let mut merchant = "";
-    let mut currency = "";
-    let mut amount_value: Option<String> = None;
-
-    if let Some(obj) = payload.as_object() {
-        if let Some(payee) = obj.get("payee").and_then(Value::as_object) {
-            merchant = payee
-                .get("name")
-                .and_then(Value::as_str)
-                .or_else(|| payee.get("id").and_then(Value::as_str))
-                .unwrap_or("");
-        }
-        currency = obj.get("currency").and_then(Value::as_str).unwrap_or("");
-        if let Some(amount) = obj.get("amount") {
-            amount_value = match amount {
-                Value::Number(num) => Some(num.to_string()),
-                Value::String(text) => Some(text.clone()),
-                _ => None,
-            };
-        }
-    }
-
-    let transaction_amount = match (amount_value, currency.is_empty()) {
-        (Some(amount), false) => format!("{amount} {currency}"),
-        (Some(amount), true) => amount,
-        (None, false) => currency.to_string(),
-        (None, true) => String::new(),
-    };
-
-    let merchant_c8 = c8string_from_str(merchant).unwrap_or_default();
-    let amount_c8 = c8string_from_str(&transaction_amount).unwrap_or_default();
-    (merchant_c8, amount_c8)
 }
 
 fn resolve_credential(
@@ -611,12 +497,6 @@ fn resolve_credential(
         .into_iter()
         .map(resolve_ts12_metadata)
         .collect::<Vec<_>>();
-    let transaction_data_types = ts12_metadata
-        .iter()
-        .map(|entry| TransactionDataType {
-            r#type: entry.data_type.r#type.clone(),
-        })
-        .collect();
 
     Ok(ResolvedCredential {
         id,
@@ -632,47 +512,26 @@ fn resolve_credential(
         doctype: credential.doctype,
         holder_binding,
         claims,
-        transaction_data_types,
         ts12_metadata,
     })
 }
 
-fn resolve_ts12_metadata(config: Ts12MetadataConfig) -> ResolvedTs12Metadata {
+fn resolve_ts12_metadata(config: Ts12MetadataConfig) -> Ts12TransactionMetadata {
     let claims = config
         .claims
         .into_iter()
-        .map(|claim| ResolvedTs12ClaimMetadata {
+        .map(|claim| Ts12ClaimMetadata {
             path: claim.path,
-            display: claim
-                .display
-                .into_iter()
-                .map(|label| ResolvedTs12LocalizedLabel {
-                    locale: label.locale,
-                    label: label.label.into(),
-                    description: label.description.map(Into::into),
-                })
-                .collect(),
+            mandatory: claim.mandatory,
+            value_type: claim.value_type,
+            displayable: claim.displayable,
         })
         .collect();
-    let ui_labels: ResolvedTs12UiLabels = config
-        .ui_labels
-        .into_iter()
-        .map(|entry| {
-            let values = entry
-                .values
-                .into_iter()
-                .map(|value| ResolvedTs12LocalizedValue {
-                    locale: value.locale,
-                    value: value.value.into(),
-                })
-                .collect();
-            (entry.key, values)
-        })
-        .collect();
-    ResolvedTs12Metadata {
-        data_type: config.data_type,
+    Ts12TransactionMetadata {
+        data_type: Ts12DataType {
+            r#type: config.data_type,
+        },
         claims,
-        ui_labels,
     }
 }
 
@@ -716,6 +575,76 @@ fn claims_description_arrays(metadata: &Value) -> Vec<&Vec<Value>> {
     out
 }
 
+fn deserialize_ts12_claim_configs<'de, D>(deserializer: D) -> Result<Vec<Ts12ClaimConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    Ok(match value {
+        Value::Array(items) => items
+            .into_iter()
+            .filter_map(|item| serde_json::from_value(item).ok())
+            .collect(),
+        _ => Vec::new(),
+    })
+}
+
+fn deserialize_displayable_claim<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    Ok(value.as_array().is_some_and(|entries| !entries.is_empty()))
+}
+
+fn deserialize_ts12_metadata_configs<'de, D>(
+    deserializer: D,
+) -> Result<Vec<Ts12MetadataConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    Ok(match value {
+        Value::Array(items) => items
+            .into_iter()
+            .filter_map(|item| serde_json::from_value(item).ok())
+            .collect(),
+        Value::Object(entries) => entries
+            .into_iter()
+            .filter_map(|(data_type, value)| {
+                let mut object = value.as_object()?.clone();
+                object.insert("type".to_string(), Value::String(data_type));
+                serde_json::from_value(Value::Object(object)).ok()
+            })
+            .collect(),
+        _ => Vec::new(),
+    })
+}
+
+fn deserialize_payment_sca_mappings<'de, D>(
+    deserializer: D,
+) -> Result<Vec<PaymentScaTypeConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    Ok(match value {
+        Value::Array(items) => items
+            .into_iter()
+            .filter_map(|item| serde_json::from_value(item).ok())
+            .collect(),
+        Value::Object(entries) => entries
+            .into_iter()
+            .filter_map(|(data_type, value)| {
+                let mut object = value.as_object()?.clone();
+                object.insert("type".to_string(), Value::String(data_type));
+                serde_json::from_value(Value::Object(object)).ok()
+            })
+            .collect(),
+        _ => Vec::new(),
+    })
+}
+
 fn value_from_claims<'a>(claims: &'a Value, path: &ClaimsPathPointer) -> Option<&'a str> {
     let Ok(nodes) = dcapi_dcql::select_nodes(claims, path) else {
         return None;
@@ -723,17 +652,46 @@ fn value_from_claims<'a>(claims: &'a Value, path: &ClaimsPathPointer) -> Option<
     nodes.first().and_then(|value| value.as_str())
 }
 
-fn transaction_data_subtype(transaction_data: &TransactionData) -> Option<&str> {
-    transaction_data
-        .extra
-        .get("subtype")
-        .and_then(Value::as_str)
+fn transaction_data_payload(transaction_data: &TransactionData) -> Option<&Value> {
+    transaction_data.extra.get("payload")
 }
 
-fn ts12_data_type_from_transaction_data(transaction_data: &TransactionData) -> Ts12DataType {
-    Ts12DataType {
-        r#type: transaction_data.r#type.clone(),
-        subtype: transaction_data_subtype(transaction_data).map(|value| value.to_string()),
+fn transaction_data_as_value(transaction_data: &TransactionData) -> Value {
+    let mut object = Map::new();
+    object.insert(
+        "type".to_string(),
+        Value::String(transaction_data.r#type.clone()),
+    );
+    object.insert(
+        "credential_ids".to_string(),
+        Value::Array(
+            transaction_data
+                .credential_ids
+                .iter()
+                .cloned()
+                .map(Value::String)
+                .collect(),
+        ),
+    );
+    if let Some(alg) = &transaction_data.transaction_data_hashes_alg {
+        object.insert(
+            "transaction_data_hashes_alg".to_string(),
+            Value::String(alg.clone()),
+        );
+    }
+    for (key, value) in &transaction_data.extra {
+        object.insert(key.clone(), value.clone());
+    }
+    Value::Object(object)
+}
+
+fn string_at_path(root: &Value, path: &ClaimsPathPointer) -> Option<String> {
+    let value = select_nodes(root, path).ok()?.into_iter().next()?;
+    match value {
+        Value::String(text) if !text.is_empty() => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        Value::Bool(value) => Some(value.to_string()),
+        _ => None,
     }
 }
 
@@ -900,5 +858,165 @@ mod tests {
         }
         assert!(has_family, "expected Family Name field");
         assert!(has_given, "expected Given Name field");
+    }
+
+    #[test]
+    fn ts12_metadata_object_map_controls_payload_compatibility() {
+        let config = json!({
+            "payment_sca": {
+                "urn:eudi:sca:eu.europa.ec:payment:single:1": {
+                    "payee": ["payload", "payee", "name"],
+                    "amount": ["payload", "amount"]
+                }
+            },
+            "credentials": [{
+                "id": "sca-1",
+                "format": "dc+sd-jwt",
+                "title": "SCA",
+                "vcts": ["vct:sca"],
+                "transaction_data_types": {
+                    "urn:eudi:sca:eu.europa.ec:payment:single:1": {
+                        "claims": [
+                            { "path": ["transaction_id"], "mandatory": true },
+                            {
+                                "path": ["amount"],
+                                "mandatory": true,
+                                "display": [{ "locale": "en", "name": "Amount" }]
+                            },
+                            {
+                                "path": ["payee", "name"],
+                                "mandatory": true,
+                                "display": [{ "locale": "en", "name": "Payee" }]
+                            }
+                        ],
+                        "ui_labels": {
+                            "affirmative_action_label": [
+                                { "locale": "en", "value": "Confirm" }
+                            ]
+                        }
+                    }
+                }
+            }]
+        })
+        .to_string();
+        let mut cursor = Cursor::new(config.as_bytes());
+        let store = PackageStore::from_reader(&mut cursor).expect("package should parse");
+        let matching = transaction_data(json!({
+            "type": "urn:eudi:sca:eu.europa.ec:payment:single:1",
+            "credential_ids": ["sca"],
+            "payload": {
+                "transaction_id": "tx-1",
+                "amount": "42.50",
+                "payee": { "name": "Example Shop" }
+            }
+        }));
+        let extra_field = transaction_data(json!({
+            "type": "urn:eudi:sca:eu.europa.ec:payment:single:1",
+            "credential_ids": ["sca"],
+            "payload": {
+                "transaction_id": "tx-1",
+                "amount": "42.50",
+                "payee": { "name": "Example Shop" },
+                "unexpected": "x"
+            }
+        }));
+
+        assert!(store.can_sign_transaction_data(&0, &matching));
+        assert!(!store.can_sign_transaction_data(&0, &extra_field));
+    }
+
+    #[test]
+    fn ts12_transaction_without_payment_sca_mapping_is_signable_if_payload_matches() {
+        let config = json!({
+            "credentials": [{
+                "id": "sca-1",
+                "format": "dc+sd-jwt",
+                "title": "SCA",
+                "vcts": ["vct:sca"],
+                "transaction_data_types": {
+                    "urn:eudi:sca:eu.europa.ec:payment:single:1": {
+                        "claims": [
+                            { "path": ["amount"], "mandatory": true },
+                            { "path": ["payee", "name"], "mandatory": true }
+                        ]
+                    }
+                }
+            }]
+        })
+        .to_string();
+        let mut cursor = Cursor::new(config.as_bytes());
+        let store = PackageStore::from_reader(&mut cursor).expect("package should parse");
+        let td = transaction_data(json!({
+            "type": "urn:eudi:sca:eu.europa.ec:payment:single:1",
+            "credential_ids": ["sca"],
+            "payload": {
+                "amount": "42.50",
+                "payee": { "name": "Example Shop" }
+            }
+        }));
+
+        assert!(store.can_sign_transaction_data(&0, &td));
+    }
+
+    #[test]
+    fn payment_sca_config_maps_multiple_types_to_payment_summary() {
+        let config = json!({
+            "payment_sca": {
+                "urn:eudi:sca:eu.europa.ec:payment:single:1": {
+                    "payee": ["payload", "payee", "name"],
+                    "amount": ["payload", "amount"]
+                },
+                "urn:eudi:sca:example.bank:payment:instant:1": {
+                    "payee": ["payload", "recipient", "display_name"],
+                    "amount": ["payload", "total"],
+                    "additional_info": ["payload", "reference"]
+                }
+            },
+            "credentials": [{
+                "id": "sca-1",
+                "format": "dc+sd-jwt",
+                "title": "SCA",
+                "vcts": ["vct:sca"],
+                "transaction_data_types": {
+                    "urn:eudi:sca:example.bank:payment:instant:1": {
+                        "claims": [
+                            { "path": ["recipient", "display_name"], "mandatory": true, "display": [{ "locale": "en", "name": "Payee" }] },
+                            { "path": ["total"], "mandatory": true, "display": [{ "locale": "en", "name": "Amount" }] },
+                            { "path": ["reference"], "display": [{ "locale": "en", "name": "Reference" }] }
+                        ],
+                        "ui_labels": {
+                            "affirmative_action_label": [{ "locale": "en", "value": "Confirm" }]
+                        }
+                    }
+                }
+            }]
+        })
+        .to_string();
+        let mut cursor = Cursor::new(config.as_bytes());
+        let store = PackageStore::from_reader(&mut cursor).expect("package should parse");
+        let td = transaction_data(json!({
+            "type": "urn:eudi:sca:example.bank:payment:instant:1",
+            "credential_ids": ["sca"],
+            "payload": {
+                "recipient": { "display_name": "Alt Shop" },
+                "total": "10.00 EUR",
+                "reference": "Order 123"
+            }
+        }));
+        let metadata = store.ts12_transaction_metadata(&0, &td).unwrap();
+        let summary = store
+            .ts12_payment_summary(&0, &td, td.extra.get("payload").unwrap(), &metadata)
+            .expect("payment summary");
+
+        assert_eq!(summary.merchant_name.as_ref().as_str(), "Alt Shop");
+        assert_eq!(summary.transaction_amount.as_ref().as_str(), "10.00 EUR");
+        assert_eq!(
+            summary.additional_info.as_deref().map(C8Str::as_str),
+            Some("Order 123")
+        );
+    }
+
+    fn transaction_data(value: Value) -> TransactionData {
+        serde_json::from_value(value).expect("transaction_data should parse")
     }
 }

@@ -383,16 +383,15 @@ where
                     continue;
                 }
 
-                let selections = selections_for_query(
+                let selection_ctx = SelectionBuildContext {
                     store,
                     options,
-                    id,
-                    selected_claims,
-                    filtered_domain,
-                    transaction_constraints.data,
-                    &transaction_constraints.ts12_indices,
-                    &assignment,
-                );
+                    transaction_data: transaction_constraints.data,
+                    ts12_indices: &transaction_constraints.ts12_indices,
+                    assignment: &assignment,
+                };
+                let selections =
+                    selections_for_query(&selection_ctx, id, selected_claims, filtered_domain);
                 if selections.is_empty() {
                     continue;
                 }
@@ -749,7 +748,7 @@ where
 
 fn meta_matches<S>(store: &S, cred: &S::CredentialRef, query: &CredentialQuery) -> bool
 where
-    S: CredentialStore,
+    S: CredentialStore + ?Sized,
 {
     if query
         .trusted_authorities()
@@ -1159,36 +1158,44 @@ fn normalize_configs(configs: Vec<Config>) -> Vec<Config> {
     out
 }
 
+struct SelectionBuildContext<'a, S>
+where
+    S: CredentialStore + ?Sized,
+{
+    store: &'a S,
+    options: &'a PlanOptions,
+    transaction_data: &'a [TransactionData],
+    ts12_indices: &'a [usize],
+    assignment: &'a TransactionAssignment<S::CredentialRef>,
+}
+
 fn selections_for_query<S>(
-    store: &S,
-    options: &PlanOptions,
+    ctx: &SelectionBuildContext<'_, S>,
     id: &str,
     selected_claims: Vec<ClaimsQuery>,
     credentials: Vec<S::CredentialRef>,
-    transaction_data: &[TransactionData],
-    ts12_indices: &[usize],
-    assignment: &TransactionAssignment<S::CredentialRef>,
 ) -> Vec<CredentialSelection<S::CredentialRef>>
 where
-    S: CredentialStore,
+    S: CredentialStore + ?Sized,
     S::CredentialRef: Clone,
 {
     credentials
         .into_iter()
         .filter_map(|credential| {
-            let mut transaction_data_ids = assignment
+            let mut transaction_data_ids = ctx
+                .assignment
                 .transaction_credential_ids
                 .iter()
                 .filter_map(|(idx, selected_id)| (selected_id == id).then_some(*idx))
                 .collect::<Vec<_>>();
 
             match select_ts12_transaction_data(
-                store,
-                options,
+                ctx.store,
+                ctx.options,
                 id,
                 &credential,
-                transaction_data,
-                ts12_indices,
+                ctx.transaction_data,
+                ctx.ts12_indices,
             ) {
                 Ts12Selection::None => {}
                 Ts12Selection::Selected(idx) => transaction_data_ids.push(idx),
@@ -1221,7 +1228,7 @@ fn select_ts12_transaction_data<S>(
     ts12_indices: &[usize],
 ) -> Ts12Selection
 where
-    S: CredentialStore,
+    S: CredentialStore + ?Sized,
 {
     let mut targeted = false;
     for index in ts12_indices {

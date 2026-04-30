@@ -21,9 +21,6 @@ pub struct Ts12DataType {
     /// Transaction data type identifier.
     #[serde(rename = "type")]
     pub r#type: String,
-    /// Optional type-specific subtype discriminator.
-    #[serde(default)]
-    pub subtype: Option<String>,
 }
 
 /// Root request envelope passed by DC API to matchers.

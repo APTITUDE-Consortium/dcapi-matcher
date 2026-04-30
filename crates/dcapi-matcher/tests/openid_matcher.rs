@@ -11,8 +11,8 @@ use dcapi_matcher::{
     PROTOCOL_OPENID4VP_V1_MULTISIGNED, PROTOCOL_OPENID4VP_V1_SIGNED,
     PROTOCOL_OPENID4VP_V1_UNSIGNED, REQUEST_PARAMETER_TRANSACTION_DATA, RESPONSE_MODE_DC_API,
     RESPONSE_MODE_DC_API_JWT, RESPONSE_TYPE_VP_TOKEN, Ts12ClaimMetadata, Ts12DataType,
-    Ts12LocalizedLabel, Ts12LocalizedValue, Ts12PaymentSummary, Ts12TransactionMetadata,
-    decode_json_package, match_dc_api_request as match_dc_api_request_internal,
+    Ts12PaymentSummary, Ts12TransactionMetadata, decode_json_package,
+    match_dc_api_request as match_dc_api_request_internal,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -21,8 +21,8 @@ use std::collections::HashSet;
 use std::ffi::CStr;
 use std::sync::Mutex;
 
-const TS12_TYPE_PAYMENT: &str = "urn:eudi:sca:payment:1";
-const TS12_TYPE_GENERIC: &str = "urn:eudi:sca:generic:1";
+const TS12_TYPE_PAYMENT: &str = "urn:eudi:sca:eu.europa.ec:payment:single:1";
+const TS12_TYPE_GENERIC: &str = "urn:eudi:sca:example:login:1";
 
 static REQUEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -47,19 +47,11 @@ fn c8string(value: &str) -> C8String {
     c8format!("{value}")
 }
 
-fn transaction_data_subtype(transaction_data: &dcapi_dcql::TransactionData) -> Option<&str> {
-    transaction_data
-        .extra
-        .get("subtype")
-        .and_then(Value::as_str)
-}
-
 fn ts12_data_type_from_transaction_data(
     transaction_data: &dcapi_dcql::TransactionData,
 ) -> Ts12DataType {
     Ts12DataType {
         r#type: transaction_data.r#type.clone(),
-        subtype: transaction_data_subtype(transaction_data).map(|value| value.to_string()),
     }
 }
 
@@ -74,20 +66,16 @@ struct TestCredential {
     holder_binding: bool,
     claims: Value,
     transaction_data_types: Vec<TransactionDataType>,
-    ts12_metadata: Vec<Ts12TransactionMetadata<'static>>,
+    ts12_metadata: Vec<Ts12TransactionMetadata>,
 }
 
 struct TestStore {
     credentials: Vec<TestCredential>,
-    preferred_locales: Vec<&'static str>,
 }
 
 impl TestStore {
     fn new(credentials: Vec<TestCredential>) -> Self {
-        Self {
-            credentials,
-            preferred_locales: vec!["en"],
-        }
+        Self { credentials }
     }
 
     fn get(&self, idx: usize) -> &TestCredential {
@@ -138,28 +126,20 @@ impl CredentialStore for TestStore {
         transaction_data: &dcapi_dcql::TransactionData,
     ) -> bool {
         let credential = self.get(*cred);
-        if !credential
+        if let Some(metadata) = credential
+            .ts12_metadata
+            .iter()
+            .find(|meta| meta.data_type.r#type == transaction_data.r#type)
+        {
+            let Some(payload) = transaction_data.extra.get("payload") else {
+                return false;
+            };
+            return metadata.is_payload_compatible(payload);
+        }
+        credential
             .transaction_data_types
             .iter()
             .any(|entry| entry.r#type == transaction_data.r#type)
-        {
-            return false;
-        }
-
-        let requires_subtype = credential.ts12_metadata.iter().any(|meta| {
-            meta.data_type.r#type == transaction_data.r#type && meta.data_type.subtype.is_some()
-        });
-        if !requires_subtype {
-            return true;
-        }
-
-        let Some(subtype) = transaction_data_subtype(transaction_data) else {
-            return false;
-        };
-        credential.ts12_metadata.iter().any(|meta| {
-            meta.data_type.r#type == transaction_data.r#type
-                && meta.data_type.subtype.as_deref() == Some(subtype)
-        })
     }
 
     fn has_claim_path(&self, cred: &Self::CredentialRef, path: &ClaimsPathPointer) -> bool {
@@ -235,7 +215,7 @@ impl MatcherStore for TestStore {
         &self,
         cred: &Self::CredentialRef,
         transaction_data: &dcapi_dcql::TransactionData,
-    ) -> Option<Ts12TransactionMetadata<'static>> {
+    ) -> Option<Ts12TransactionMetadata> {
         let data_type = ts12_data_type_from_transaction_data(transaction_data);
         self.get(*cred)
             .ts12_metadata
@@ -249,8 +229,7 @@ impl MatcherStore for TestStore {
         _cred: &Self::CredentialRef,
         transaction_data: &dcapi_dcql::TransactionData,
         payload: &Value,
-        _metadata: &Ts12TransactionMetadata<'a>,
-        _locale: &str,
+        _metadata: &Ts12TransactionMetadata,
     ) -> Option<Ts12PaymentSummary<'a>> {
         if transaction_data.r#type != TS12_TYPE_PAYMENT {
             return None;
@@ -262,16 +241,7 @@ impl MatcherStore for TestStore {
             .and_then(|payee| payee.get("name"))
             .and_then(Value::as_str)?
             .to_string();
-        let amount = payload.get("amount")?.to_string();
-        let currency = payload
-            .get("currency")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let transaction_amount = if currency.is_empty() {
-            amount
-        } else {
-            format!("{amount} {currency}")
-        };
+        let transaction_amount = string_value(payload.get("amount")?)?;
         Some(Ts12PaymentSummary {
             merchant_name: Cow::Owned(c8string(&merchant_name)),
             transaction_amount: Cow::Owned(c8string(&transaction_amount)),
@@ -282,126 +252,69 @@ impl MatcherStore for TestStore {
     fn openid4vp_config(&self) -> dcapi_matcher::OpenId4VpConfig {
         dcapi_matcher::OpenId4VpConfig::openid4vp1()
     }
+}
 
-    fn locales(&self) -> &[&str] {
-        self.preferred_locales.as_slice()
+fn string_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        Value::Bool(value) => Some(value.to_string()),
+        _ => None,
     }
 }
 
-fn ts12_payment_metadata() -> Ts12TransactionMetadata<'static> {
-    let ui_labels = vec![(
-        "affirmative_action_label".to_string(),
-        vec![Ts12LocalizedValue {
-            locale: "en".to_string(),
-            value: Cow::Borrowed(c8!("Confirm")),
-        }],
-    )];
+fn ts12_payment_metadata() -> Ts12TransactionMetadata {
     Ts12TransactionMetadata {
         data_type: Ts12DataType {
             r#type: TS12_TYPE_PAYMENT.to_string(),
-            subtype: None,
         },
         claims: vec![
-            Ts12ClaimMetadata {
-                path: vec![
-                    PathElement::String("payload".to_string()),
-                    PathElement::String("transaction_id".to_string()),
-                ],
-                display: vec![Ts12LocalizedLabel {
-                    locale: "en".to_string(),
-                    label: Cow::Borrowed(c8!("Transaction ID")),
-                    description: None,
-                }],
-            },
-            Ts12ClaimMetadata {
-                path: vec![
-                    PathElement::String("payload".to_string()),
-                    PathElement::String("payee".to_string()),
-                    PathElement::String("name".to_string()),
-                ],
-                display: vec![Ts12LocalizedLabel {
-                    locale: "en".to_string(),
-                    label: Cow::Borrowed(c8!("Payee")),
-                    description: None,
-                }],
-            },
-            Ts12ClaimMetadata {
-                path: vec![
-                    PathElement::String("payload".to_string()),
-                    PathElement::String("payee".to_string()),
-                    PathElement::String("id".to_string()),
-                ],
-                display: vec![Ts12LocalizedLabel {
-                    locale: "en".to_string(),
-                    label: Cow::Borrowed(c8!("Payee ID")),
-                    description: None,
-                }],
-            },
-            Ts12ClaimMetadata {
-                path: vec![
-                    PathElement::String("payload".to_string()),
-                    PathElement::String("currency".to_string()),
-                ],
-                display: vec![Ts12LocalizedLabel {
-                    locale: "en".to_string(),
-                    label: Cow::Borrowed(c8!("Currency")),
-                    description: None,
-                }],
-            },
-            Ts12ClaimMetadata {
-                path: vec![
-                    PathElement::String("payload".to_string()),
-                    PathElement::String("amount".to_string()),
-                ],
-                display: vec![Ts12LocalizedLabel {
-                    locale: "en".to_string(),
-                    label: Cow::Borrowed(c8!("Amount")),
-                    description: None,
-                }],
-            },
+            internal_claim(&["transaction_id"], true),
+            display_claim(&["payee", "name"], "Payee", true, None),
+            internal_claim(&["payee", "id"], true),
+            display_claim(&["amount"], "Amount", true, Some("iso_currency_amount")),
         ],
-        ui_labels,
     }
 }
 
-fn ts12_generic_metadata() -> Ts12TransactionMetadata<'static> {
-    let ui_labels = vec![(
-        "affirmative_action_label".to_string(),
-        vec![Ts12LocalizedValue {
-            locale: "en".to_string(),
-            value: Cow::Borrowed(c8!("Confirm")),
-        }],
-    )];
+fn ts12_generic_metadata() -> Ts12TransactionMetadata {
     Ts12TransactionMetadata {
         data_type: Ts12DataType {
             r#type: TS12_TYPE_GENERIC.to_string(),
-            subtype: Some("login".to_string()),
         },
         claims: vec![
-            Ts12ClaimMetadata {
-                path: vec![
-                    PathElement::String("payload".to_string()),
-                    PathElement::String("transaction_id".to_string()),
-                ],
-                display: vec![Ts12LocalizedLabel {
-                    locale: "en".to_string(),
-                    label: Cow::Borrowed(c8!("Transaction ID")),
-                    description: None,
-                }],
-            },
-            Ts12ClaimMetadata {
-                path: vec![
-                    PathElement::String("payload".to_string()),
-                    PathElement::String("channel".to_string()),
-                ],
-                display: vec![Ts12LocalizedLabel {
-                    locale: "en".to_string(),
-                    label: Cow::Borrowed(c8!("Channel")),
-                    description: None,
-                }],
-            },
+            display_claim(&["transaction_id"], "Transaction ID", true, None),
+            display_claim(&["channel"], "Channel", true, None),
         ],
-        ui_labels,
+    }
+}
+
+fn internal_claim(path: &[&str], mandatory: bool) -> Ts12ClaimMetadata {
+    Ts12ClaimMetadata {
+        path: path
+            .iter()
+            .map(|part| PathElement::String((*part).to_string()))
+            .collect(),
+        mandatory,
+        value_type: None,
+        displayable: false,
+    }
+}
+
+fn display_claim(
+    path: &[&str],
+    label: &'static str,
+    mandatory: bool,
+    value_type: Option<&str>,
+) -> Ts12ClaimMetadata {
+    Ts12ClaimMetadata {
+        path: path
+            .iter()
+            .map(|part| PathElement::String((*part).to_string()))
+            .collect(),
+        mandatory,
+        value_type: value_type.map(str::to_string),
+        displayable: !label.is_empty(),
     }
 }
 
@@ -563,10 +476,6 @@ impl<'a> MatcherStore for VpOverride<'a> {
     fn openid4vp_config(&self) -> dcapi_matcher::OpenId4VpConfig {
         self.config.clone()
     }
-
-    fn locales(&self) -> &[&str] {
-        self.inner.locales()
-    }
 }
 
 fn entry_metadata<'a>(entry: &'a CredentialEntry<'a>) -> Option<&'a CStr> {
@@ -574,6 +483,13 @@ fn entry_metadata<'a>(entry: &'a CredentialEntry<'a>) -> Option<&'a CStr> {
         CredentialEntry::StringId(entry) => entry.metadata.as_deref(),
         CredentialEntry::Payment(entry) => entry.metadata.as_deref(),
     }
+}
+
+fn entry_metadata_json<'a>(entry: &'a CredentialEntry<'a>) -> Value {
+    let metadata = entry_metadata(entry)
+        .and_then(|value| value.to_str().ok())
+        .expect("entry metadata");
+    serde_json::from_str(metadata).expect("metadata json")
 }
 
 fn entry_cred_id<'a>(entry: &'a CredentialEntry<'a>) -> &'a CStr {
@@ -756,7 +672,14 @@ fn openid4vp_transaction_data_encoded_is_decoded_and_attached() {
             "data": {
                 "dcql_query": {
                     "credentials": [
-                        { "id": "pid", "format": "dc+sd-jwt", "meta": { "vct_values": ["vct:pid"] } }
+                        {
+                            "id": "pid",
+                            "format": "dc+sd-jwt",
+                            "meta": { "vct_values": ["vct:pid"] },
+                            "claims": [
+                                { "id": "name", "path": ["name"], "values": ["Alice"] }
+                            ]
+                        }
                     ]
                 },
                 "transaction_data": [encoded]
@@ -770,12 +693,13 @@ fn openid4vp_transaction_data_encoded_is_decoded_and_attached() {
         panic!("expected set");
     };
     let first = &set.slots[0].alternatives[0];
-    let metadata = entry_metadata(first)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("");
-    assert!(metadata.contains("\"dcql_id\":\"pid\""));
-    assert!(metadata.contains("\"credential_id\":\"pid-1\""));
-    assert!(metadata.contains("\"transaction_data_indices\":[0]"));
+    let metadata = entry_metadata_json(first);
+    assert_eq!(metadata["dcql_id"], "pid");
+    assert_eq!(metadata["credential_id"], "pid-1");
+    assert_eq!(
+        metadata["transaction_data"],
+        json!({ "index": 0, "displayed": false })
+    );
 }
 
 #[test]
@@ -803,14 +727,15 @@ fn openid4vp_transaction_data_with_unknown_targets_is_ignored() {
     let MatcherResult::Group(set) = &response.results[0] else {
         panic!("expected set");
     };
-    let metadata = entry_metadata(&set.slots[0].alternatives[0])
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("");
-    assert!(metadata.contains("\"transaction_data_indices\":[1]"));
+    let metadata = entry_metadata_json(&set.slots[0].alternatives[0]);
+    assert_eq!(
+        metadata["transaction_data"],
+        json!({ "index": 1, "displayed": false })
+    );
 }
 
 #[test]
-fn openid4vp_ts12_payment_renders_payment_entry_with_fields() {
+fn openid4vp_ts12_payment_renders_payment_entry_and_marks_transaction_data_displayed() {
     let store = test_store();
     let request = json!({
         "requests": [{
@@ -827,8 +752,7 @@ fn openid4vp_ts12_payment_renders_payment_entry_with_fields() {
                     "payload": {
                         "transaction_id": "tx-1",
                         "payee": { "name": "Example Shop", "id": "merchant-1" },
-                        "currency": "EUR",
-                        "amount": 42.50
+                        "amount": "42.50 EUR"
                     }
                 }]
             }
@@ -842,7 +766,12 @@ fn openid4vp_ts12_payment_renders_payment_entry_with_fields() {
     };
     let first = &set.slots[0].alternatives[0];
     assert!(matches!(first, CredentialEntry::Payment(_)));
-    assert!(!entry_fields(first).is_empty());
+    assert!(entry_fields(first).is_empty());
+    let metadata = entry_metadata_json(first);
+    assert_eq!(
+        metadata["transaction_data"],
+        json!({ "index": 0, "displayed": true })
+    );
 
     let _ = test_shim::take_display();
     response.render();
@@ -850,29 +779,20 @@ fn openid4vp_ts12_payment_renders_payment_entry_with_fields() {
     assert!(events.iter().any(|event| matches!(
         event,
         DisplayEvent::AddPaymentEntry { merchant_name, transaction_amount, .. }
-            if merchant_name == "Example Shop" && transaction_amount == "42.5 EUR"
+            if merchant_name == "Example Shop" && transaction_amount == "42.50 EUR"
     ) || matches!(
         event,
         DisplayEvent::AddPaymentEntryToSet { merchant_name, transaction_amount, .. }
-            if merchant_name == "Example Shop" && transaction_amount == "42.5 EUR"
+            if merchant_name == "Example Shop" && transaction_amount == "42.50 EUR"
     ) || matches!(
         event,
         DisplayEvent::AddPaymentEntryToSetV2 { merchant_name, transaction_amount, .. }
-            if merchant_name == "Example Shop" && transaction_amount == "42.5 EUR"
-    )));
-    assert!(events.iter().any(|event| matches!(
-        event,
-        DisplayEvent::AddFieldForStringIdEntry { display_name, .. }
-            if display_name == "Transaction ID" || display_name == "name"
-    ) || matches!(
-        event,
-        DisplayEvent::AddFieldToEntrySet { field_display_name, .. }
-            if field_display_name == "Transaction ID" || field_display_name == "name"
+            if merchant_name == "Example Shop" && transaction_amount == "42.50 EUR"
     )));
 }
 
 #[test]
-fn openid4vp_ts12_generic_requires_subtype() {
+fn openid4vp_ts12_generic_rejects_undeclared_payload_field() {
     let store = test_store();
     let request = json!({
         "requests": [{
@@ -902,7 +822,7 @@ fn openid4vp_ts12_generic_requires_subtype() {
 }
 
 #[test]
-fn openid4vp_ts12_generic_renders_transaction_fields() {
+fn openid4vp_ts12_generic_marks_transaction_data_without_displaying_it() {
     let store = test_store();
     let request = json!({
         "requests": [{
@@ -915,7 +835,6 @@ fn openid4vp_ts12_generic_renders_transaction_fields() {
                 },
                 "transaction_data": [{
                     "type": TS12_TYPE_GENERIC,
-                    "subtype": "login",
                     "credential_ids": ["pid"],
                     "payload": {
                         "transaction_id": "tx-login-2",
@@ -933,11 +852,16 @@ fn openid4vp_ts12_generic_renders_transaction_fields() {
     };
     let first = &set.slots[0].alternatives[0];
     assert!(matches!(first, CredentialEntry::StringId(_)));
-    assert!(!entry_fields(first).is_empty());
+    assert!(entry_fields(first).is_empty());
+    let metadata = entry_metadata_json(first);
+    assert_eq!(
+        metadata["transaction_data"],
+        json!({ "index": 0, "displayed": false })
+    );
 }
 
 #[test]
-fn openid4vp_ts12_allows_fallback_locale() {
+fn openid4vp_ts12_payment_does_not_require_ui_labels() {
     let store = test_store();
     let request = json!({
         "requests": [{
@@ -954,8 +878,7 @@ fn openid4vp_ts12_allows_fallback_locale() {
                     "payload": {
                         "transaction_id": "tx-1",
                         "payee": { "name": "Example Shop", "id": "merchant-1" },
-                        "currency": "EUR",
-                        "amount": 42.50
+                        "amount": "42.50 EUR"
                     }
                 }]
             }
@@ -978,7 +901,10 @@ fn openid4vp_request_protocol_is_gated() {
                     "credentials": [
                         { "id": "pid", "format": "dc+sd-jwt", "meta": { "vct_values": ["vct:pid"] } }
                     ]
-                }
+                },
+                "transaction_data": [
+                    { "type": "payment", "credential_ids": ["pid"] }
+                ]
             }
         }]
     })
@@ -1115,9 +1041,19 @@ fn openid4vp_unsigned_request_ignores_client_identification_fields() {
                 "expected_origins": ["https://verifier.example"],
                 "dcql_query": {
                     "credentials": [
-                        { "id": "pid", "format": "dc+sd-jwt", "meta": { "vct_values": ["vct:pid"] } }
+                        {
+                            "id": "pid",
+                            "format": "dc+sd-jwt",
+                            "meta": { "vct_values": ["vct:pid"] },
+                            "claims": [
+                                { "id": "name", "path": ["name"], "values": ["Alice"] }
+                            ]
+                        }
                     ]
-                }
+                },
+                "transaction_data": [
+                    { "type": "payment", "credential_ids": ["pid"] }
+                ]
             }
         }]
     })
@@ -1321,6 +1257,73 @@ fn unknown_protocol_is_ignored() {
 }
 
 #[test]
+fn top_level_requests_are_exposed_as_alternatives_not_first_wins() {
+    let store = test_store();
+    let request = json!({
+        "requests": [
+            {
+                "protocol": "unknown-protocol",
+                "data": {}
+            },
+            {
+                "protocol": PROTOCOL_OPENID4VP_V1_UNSIGNED,
+                "data": {
+                    "dcql_query": {
+                        "credentials": [
+                            { "id": "pid", "format": "dc+sd-jwt", "meta": { "vct_values": ["vct:pid"] } }
+                        ]
+                    }
+                }
+            },
+            {
+                "protocol": PROTOCOL_OPENID4VP_V1_UNSIGNED,
+                "data": {
+                    "dcql_query": {
+                        "credentials": [
+                            { "id": "mdl", "format": "mso_mdoc", "meta": { "doctype_value": "org.iso.18013.5.1.mDL" } }
+                        ]
+                    }
+                }
+            }
+        ]
+    })
+    .to_string();
+
+    let response = match_dc_api_request(&request, &store, &MatcherOptions::default()).unwrap();
+    assert_eq!(response.results.len(), 2);
+
+    let groups = response
+        .results
+        .iter()
+        .map(|result| {
+            let MatcherResult::Group(set) = result else {
+                panic!("expected group");
+            };
+            let set_id = set.set_id.to_str().unwrap().to_string();
+            let entry_id = entry_cred_id(&set.slots[0].alternatives[0])
+                .to_str()
+                .unwrap()
+                .to_string();
+            (set_id, entry_id)
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        groups,
+        vec![
+            (
+                "openid4vp-v1-unsigned:1:dcql:0".to_string(),
+                "pid-1".to_string()
+            ),
+            (
+                "openid4vp-v1-unsigned:2:dcql:0".to_string(),
+                "mdl-1".to_string()
+            )
+        ]
+    );
+}
+
+#[test]
 fn metadata_preserves_object_key_order() {
     let store = test_store();
     let request = json!({
@@ -1329,9 +1332,19 @@ fn metadata_preserves_object_key_order() {
             "data": {
                 "dcql_query": {
                     "credentials": [
-                        { "id": "pid", "format": "dc+sd-jwt", "meta": { "vct_values": ["vct:pid"] } }
+                        {
+                            "id": "pid",
+                            "format": "dc+sd-jwt",
+                            "meta": { "vct_values": ["vct:pid"] },
+                            "claims": [
+                                { "id": "name", "path": ["name"], "values": ["Alice"] }
+                            ]
+                        }
                     ]
-                }
+                },
+                "transaction_data": [
+                    { "type": "payment", "credential_ids": ["pid"] }
+                ]
             }
         }]
     })
@@ -1346,9 +1359,9 @@ fn metadata_preserves_object_key_order() {
         .unwrap_or("");
     let pos_credential = metadata.find("\"credential_id\"").unwrap();
     let pos_dcql = metadata.find("\"dcql_id\"").unwrap();
-    let pos_indices = metadata.find("\"transaction_data_indices\"").unwrap();
+    let pos_transaction_data = metadata.find("\"transaction_data\"").unwrap();
     assert!(pos_credential < pos_dcql);
-    assert!(pos_dcql < pos_indices);
+    assert!(pos_dcql < pos_transaction_data);
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]

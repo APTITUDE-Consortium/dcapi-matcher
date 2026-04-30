@@ -8,8 +8,8 @@
 
 **TS12 Handling**
 - No built-in TS12 transaction data types exist in this library. The credential package must provide fully resolved metadata for each supported transaction data type.
-- The store must supply `Ts12TransactionMetadata` with `type`, optional `subtype`, `claims`, and `ui_labels`. Any `claims_uri`/`ui_labels_uri` resolution and `extends` merging must be done by the store.
-- Internationalization is enforced: UI labels and claim display labels must exist for the selected locale. If localized labels are missing, the transaction data entry is skipped with a warning.
+- The store must supply `Ts12TransactionMetadata` with full transaction data `type` URNs and payload-relative `claims`. Any `claims_uri` resolution or metadata merging must be done by the store.
+- Claim display metadata is used only to decide whether TS12 value-type validation applies. It is not rendered as Credential Manager fields.
 - Payment rendering is store-driven. Use `MatcherStore::ts12_payment_summary` to indicate a transaction should render as a payment entry. The matcher does not infer payment types.
 
 **Transaction Data Warnings**

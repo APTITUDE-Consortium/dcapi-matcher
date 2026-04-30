@@ -31,8 +31,11 @@ entry/set structures.
 
 For each candidate credential, metadata passed to Credman includes only:
 
-- `credential_id` (the DCQL credential query id)
-- `transaction_data_indices` (indices into the request `transaction_data` array)
+- `dcql_id` (the DCQL credential query id)
+- `credential_id` (the matched wallet credential id)
+- `transaction_data` when a transaction data object is associated with the credential:
+  - `index` (index into the request `transaction_data` array)
+  - `displayed` (`true` when shown in dedicated UI, e.g. payment/SCA)
 
 ## Diagnostics Rendering
 
@@ -57,6 +60,8 @@ credential set (`dcapi:diagnostics`).
 The matcher currently enforces and/or supports the following OpenID behavior:
 
 - OpenID4VP:
+  - top-level DC-API `requests[]` are treated as alternatives: every supported and satisfiable
+    request is exposed to Credman, with request indices preserved in set ids.
   - `dcql_query` evaluation (delegated to `dcapi-dcql`) with optional `transaction_data`.
   - supported request protocol variants are listed in `supported_request_protocols`.
   - supported response modes are listed in `supported_response_modes`.
@@ -68,16 +73,11 @@ The matcher currently enforces and/or supports the following OpenID behavior:
   - `openid4vp-v1-signed` and `openid4vp-v1-multisigned` require decoded request objects;
     raw `request` objects are rejected (no JWS verification in this crate).
   - TS12 SCA transaction-data support:
-    - built-in validation for `urn:eudi:sca:payment:1` and `urn:eudi:sca:generic:1`.
-    - TS12 display is driven by credential-provided transaction metadata
-      (`MatcherStore::ts12_transaction_metadata`) with localized claim labels and UI labels.
-    - `MatcherStore::locales` must be provided for TS12; missing localized labels cause
-      the matcher to return an error.
-    - transaction fields are emitted as entry fields and appear before claim fields in string-id entries.
-    - payment-style rendering is only used when a single TS12 entry provides payment payload data,
-      and additional info is derived from localized transaction fields (no hardcoded labels).
-    - optional `MatcherStore::format_ts12_value` hook lets wallets localize value codes
-      (for example, recurrence frequency identifiers) without hardcoded strings in the matcher.
+    - supported TS12 prefixes are configured through `PlanOptions::ts12_prefixes`.
+    - `MatcherStore::ts12_transaction_metadata` validates transaction payload compatibility.
+    - transaction payload claims are not rendered as generic Credman fields.
+    - payment-style rendering is only used when exactly one TS12 entry provides a payment summary
+      through `MatcherStore::ts12_payment_summary`.
 
 This split is intentional: `dcapi-matcher` provides deterministic matching and response shaping,
 while network retrieval and cryptographic verification for signed flows can be layered on top by the integrator.
