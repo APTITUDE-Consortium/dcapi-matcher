@@ -114,7 +114,7 @@ pub trait MatcherStore: CredentialStore {
         None
     }
 
-    /// Returns resolved TS12 transaction metadata for display and validation.
+    /// Returns resolved TS12 transaction metadata for display and rendering.
     ///
     /// Implementers must resolve any `claims_uri` / `ui_labels_uri` references and apply
     /// `extends` merging rules before returning this metadata. The returned metadata must

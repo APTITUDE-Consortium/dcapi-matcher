@@ -17,11 +17,11 @@ entry/set structures.
 
 ## Main API
 
-- `match_dc_api_request(store, options, profile)` (reads the DC API request JSON from Credman)
+- `match_dc_api_request(store, options)` (reads the DC API request JSON from Credman)
 - `MatcherStore` (your package adapter trait)
 - `MatcherResponse` (owned response; apply with `apply()`)
 - `diagnostics` (collect and render execution diagnostics as Credman entries)
-- `Profile` (request-level compliance hooks; use `DefaultProfile` or `HaipProfile`)
+- `OpenId4VpConfig` (wallet-supported OpenID4VP capabilities)
 
 ## Package Decode Helpers
 
@@ -52,14 +52,18 @@ credential set (`dcapi:diagnostics`).
 - Manual recording:
   - use `diagnostics::trace/debug/info/warn/error` to add app-specific diagnostics.
 
-## OpenID Compliance Profile
+## OpenID Capability Support
 
 The matcher currently enforces and/or supports the following OpenID behavior:
 
 - OpenID4VP:
   - `dcql_query` evaluation (delegated to `dcapi-dcql`) with optional `transaction_data`.
-  - `scope`-based DCQL queries are not supported (enable `allow_dcql_scope` to surface an error).
-  - `response_mode = dc_api.jwt` is gated by `OpenId4VpConfig::allow_response_mode_jwt`.
+  - supported request protocol variants are listed in `supported_request_protocols`.
+  - supported response modes are listed in `supported_response_modes`.
+  - supported response types are listed in `supported_response_types`.
+  - supported query methods are listed in `supported_query_methods`.
+  - supported extra request parameters are listed in `supported_request_parameters`.
+  - unsupported OpenID parts are ignored and produce no match.
   - unknown request parameters are ignored.
   - `openid4vp-v1-signed` and `openid4vp-v1-multisigned` require decoded request objects;
     raw `request` objects are rejected (no JWS verification in this crate).

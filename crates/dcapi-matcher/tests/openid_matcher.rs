@@ -7,11 +7,12 @@ use dcapi_dcql::{
     TransactionDataType, ValueMatch,
 };
 use dcapi_matcher::{
-    CredentialEntry, DefaultProfile, Field, MatcherError, MatcherOptions, MatcherResult,
-    MatcherStore, PROTOCOL_OPENID4VP_V1_MULTISIGNED, PROTOCOL_OPENID4VP_V1_SIGNED,
-    PROTOCOL_OPENID4VP_V1_UNSIGNED, Ts12ClaimMetadata, Ts12DataType, Ts12LocalizedLabel,
-    Ts12LocalizedValue, Ts12PaymentSummary, Ts12TransactionMetadata, decode_json_package,
-    match_dc_api_request as match_dc_api_request_internal,
+    CredentialEntry, Field, MatcherError, MatcherOptions, MatcherResult, MatcherStore,
+    PROTOCOL_OPENID4VP_V1_MULTISIGNED, PROTOCOL_OPENID4VP_V1_SIGNED,
+    PROTOCOL_OPENID4VP_V1_UNSIGNED, REQUEST_PARAMETER_TRANSACTION_DATA, RESPONSE_MODE_DC_API,
+    RESPONSE_MODE_DC_API_JWT, RESPONSE_TYPE_VP_TOKEN, Ts12ClaimMetadata, Ts12DataType,
+    Ts12LocalizedLabel, Ts12LocalizedValue, Ts12PaymentSummary, Ts12TransactionMetadata,
+    decode_json_package, match_dc_api_request as match_dc_api_request_internal,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -32,7 +33,7 @@ fn match_dc_api_request<'a>(
 ) -> Result<dcapi_matcher::MatcherResponse<'a>, MatcherError> {
     let _guard = REQUEST_LOCK.lock().unwrap();
     test_shim::set_request(request.as_bytes());
-    match_dc_api_request_internal(store, options, &DefaultProfile)
+    match_dc_api_request_internal(store, options)
 }
 
 fn unsupported_reader<T>() -> Result<T, std::io::Error> {
@@ -146,8 +147,7 @@ impl CredentialStore for TestStore {
         }
 
         let requires_subtype = credential.ts12_metadata.iter().any(|meta| {
-            meta.data_type.r#type == transaction_data.r#type
-                && meta.data_type.subtype.is_some()
+            meta.data_type.r#type == transaction_data.r#type && meta.data_type.subtype.is_some()
         });
         if !requires_subtype {
             return true;
@@ -280,14 +280,7 @@ impl MatcherStore for TestStore {
     }
 
     fn openid4vp_config(&self) -> dcapi_matcher::OpenId4VpConfig {
-        dcapi_matcher::OpenId4VpConfig {
-            enabled: true,
-            allow_dcql: true,
-            allow_dcql_scope: false,
-            allow_transaction_data: true,
-            allow_signed_requests: false,
-            allow_response_mode_jwt: false,
-        }
+        dcapi_matcher::OpenId4VpConfig::openid4vp1()
     }
 
     fn locales(&self) -> &[&str] {
@@ -568,7 +561,7 @@ impl<'a> MatcherStore for VpOverride<'a> {
     }
 
     fn openid4vp_config(&self) -> dcapi_matcher::OpenId4VpConfig {
-        self.config
+        self.config.clone()
     }
 
     fn locales(&self) -> &[&str] {
@@ -682,7 +675,14 @@ fn openid4vp_dcql_single_set_with_multiple_options_merges_alternatives() {
         .filter_map(|entry| entry_cred_id(entry).to_str().ok().map(str::to_string))
         .collect::<Vec<_>>();
     alt_ids.sort();
-    assert_eq!(alt_ids, vec!["mdl-1".to_string(), "pid-1".to_string(), "pid-2".to_string()]);
+    assert_eq!(
+        alt_ids,
+        vec![
+            "mdl-1".to_string(),
+            "pid-1".to_string(),
+            "pid-2".to_string()
+        ]
+    );
 }
 
 #[test]
@@ -776,6 +776,37 @@ fn openid4vp_transaction_data_encoded_is_decoded_and_attached() {
     assert!(metadata.contains("\"dcql_id\":\"pid\""));
     assert!(metadata.contains("\"credential_id\":\"pid-1\""));
     assert!(metadata.contains("\"transaction_data_indices\":[0]"));
+}
+
+#[test]
+fn openid4vp_transaction_data_with_unknown_targets_is_ignored() {
+    let store = test_store();
+    let request = json!({
+        "requests": [{
+            "protocol": PROTOCOL_OPENID4VP_V1_UNSIGNED,
+            "data": {
+                "dcql_query": {
+                    "credentials": [
+                        { "id": "pid", "format": "dc+sd-jwt", "meta": { "vct_values": ["vct:pid"] } }
+                    ]
+                },
+                "transaction_data": [
+                    { "type": "payment", "credential_ids": ["missing"] },
+                    { "type": "payment", "credential_ids": ["pid"] }
+                ]
+            }
+        }]
+    })
+    .to_string();
+
+    let response = match_dc_api_request(&request, &store, &MatcherOptions::default()).unwrap();
+    let MatcherResult::Group(set) = &response.results[0] else {
+        panic!("expected set");
+    };
+    let metadata = entry_metadata(&set.slots[0].alternatives[0])
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    assert!(metadata.contains("\"transaction_data_indices\":[1]"));
 }
 
 #[test]
@@ -937,6 +968,37 @@ fn openid4vp_ts12_allows_fallback_locale() {
 }
 
 #[test]
+fn openid4vp_request_protocol_is_gated() {
+    let store = test_store();
+    let request = json!({
+        "requests": [{
+            "protocol": PROTOCOL_OPENID4VP_V1_UNSIGNED,
+            "data": {
+                "dcql_query": {
+                    "credentials": [
+                        { "id": "pid", "format": "dc+sd-jwt", "meta": { "vct_values": ["vct:pid"] } }
+                    ]
+                }
+            }
+        }]
+    })
+    .to_string();
+
+    let wrapped = VpOverride {
+        inner: &store,
+        config: dcapi_matcher::OpenId4VpConfig {
+            supported_request_protocols: vec![],
+            ..dcapi_matcher::OpenId4VpConfig::openid4vp1()
+        },
+    };
+    let response = match_dc_api_request(&request, &wrapped, &MatcherOptions::default()).unwrap();
+    assert!(response.results.is_empty());
+
+    let response = match_dc_api_request(&request, &store, &MatcherOptions::default()).unwrap();
+    assert!(!response.results.is_empty());
+}
+
+#[test]
 fn openid4vp_signed_protocol_reports_unsupported() {
     let store = test_store();
     let request = json!({
@@ -995,6 +1057,54 @@ fn openid4vp_ignores_unknown_parameters() {
 }
 
 #[test]
+fn openid4vp_malformed_dcql_query_is_ignored() {
+    let store = test_store();
+    let request = json!({
+        "requests": [{
+            "protocol": PROTOCOL_OPENID4VP_V1_UNSIGNED,
+            "data": {
+                "dcql_query": {
+                    "credentials": []
+                }
+            }
+        }]
+    })
+    .to_string();
+
+    let response = match_dc_api_request(&request, &store, &MatcherOptions::default()).unwrap();
+    assert!(response.results.is_empty());
+}
+
+#[test]
+fn openid4vp_malformed_transaction_data_is_ignored() {
+    let store = test_store();
+    let request = json!({
+        "requests": [{
+            "protocol": PROTOCOL_OPENID4VP_V1_UNSIGNED,
+            "data": {
+                "dcql_query": {
+                    "credentials": [
+                        { "id": "pid", "format": "dc+sd-jwt", "meta": { "vct_values": ["vct:pid"] } }
+                    ]
+                },
+                "transaction_data": [42, {"credential_ids": ["pid"]}]
+            }
+        }]
+    })
+    .to_string();
+
+    let wrapped = VpOverride {
+        inner: &store,
+        config: dcapi_matcher::OpenId4VpConfig {
+            supported_request_parameters: vec![],
+            ..dcapi_matcher::OpenId4VpConfig::openid4vp1()
+        },
+    };
+    let response = match_dc_api_request(&request, &wrapped, &MatcherOptions::default()).unwrap();
+    assert_eq!(response.results.len(), 1);
+}
+
+#[test]
 fn openid4vp_unsigned_request_ignores_client_identification_fields() {
     let store = test_store();
     let request = json!({
@@ -1039,12 +1149,8 @@ fn openid4vp_dcql_disabled_returns_empty() {
     .to_string();
 
     let vp_config = dcapi_matcher::OpenId4VpConfig {
-        enabled: true,
-        allow_dcql: false,
-        allow_dcql_scope: false,
-        allow_transaction_data: true,
-        allow_signed_requests: false,
-        allow_response_mode_jwt: false,
+        supported_query_methods: vec![],
+        ..dcapi_matcher::OpenId4VpConfig::openid4vp1()
     };
     let wrapped = VpOverride {
         inner: &store,
@@ -1055,30 +1161,29 @@ fn openid4vp_dcql_disabled_returns_empty() {
 }
 
 #[test]
-fn openid4vp_response_mode_jwt_is_gated() {
+fn openid4vp_transaction_data_is_gated() {
     let store = test_store();
     let request = json!({
         "requests": [{
             "protocol": PROTOCOL_OPENID4VP_V1_UNSIGNED,
             "data": {
-                "response_mode": "dc_api.jwt",
                 "dcql_query": {
                     "credentials": [
                         { "id": "pid", "format": "dc+sd-jwt", "meta": { "vct_values": ["vct:pid"] } }
                     ]
-                }
+                },
+                "transaction_data": [{
+                    "type": "payment",
+                    "credential_ids": ["pid"]
+                }]
             }
         }]
     })
     .to_string();
 
     let vp_config = dcapi_matcher::OpenId4VpConfig {
-        enabled: true,
-        allow_dcql: true,
-        allow_dcql_scope: false,
-        allow_transaction_data: true,
-        allow_signed_requests: false,
-        allow_response_mode_jwt: false,
+        supported_request_parameters: vec![],
+        ..dcapi_matcher::OpenId4VpConfig::openid4vp1()
     };
     let wrapped = VpOverride {
         inner: &store,
@@ -1090,7 +1195,47 @@ fn openid4vp_response_mode_jwt_is_gated() {
     let wrapped = VpOverride {
         inner: &store,
         config: dcapi_matcher::OpenId4VpConfig {
-            allow_response_mode_jwt: true,
+            supported_request_parameters: vec![REQUEST_PARAMETER_TRANSACTION_DATA.to_string()],
+            ..dcapi_matcher::OpenId4VpConfig::openid4vp1()
+        },
+    };
+    let response = match_dc_api_request(&request, &wrapped, &MatcherOptions::default()).unwrap();
+    assert!(!response.results.is_empty());
+}
+
+#[test]
+fn openid4vp_response_mode_jwt_is_gated() {
+    let store = test_store();
+    let request = json!({
+        "requests": [{
+            "protocol": PROTOCOL_OPENID4VP_V1_UNSIGNED,
+            "data": {
+                "response_mode": RESPONSE_MODE_DC_API_JWT,
+                "dcql_query": {
+                    "credentials": [
+                        { "id": "pid", "format": "dc+sd-jwt", "meta": { "vct_values": ["vct:pid"] } }
+                    ]
+                }
+            }
+        }]
+    })
+    .to_string();
+
+    let vp_config = dcapi_matcher::OpenId4VpConfig::openid4vp1();
+    let wrapped = VpOverride {
+        inner: &store,
+        config: vp_config.clone(),
+    };
+    let response = match_dc_api_request(&request, &wrapped, &MatcherOptions::default()).unwrap();
+    assert!(response.results.is_empty());
+
+    let wrapped = VpOverride {
+        inner: &store,
+        config: dcapi_matcher::OpenId4VpConfig {
+            supported_response_modes: vec![
+                RESPONSE_MODE_DC_API.to_string(),
+                RESPONSE_MODE_DC_API_JWT.to_string(),
+            ],
             ..vp_config
         },
     };
@@ -1099,7 +1244,47 @@ fn openid4vp_response_mode_jwt_is_gated() {
 }
 
 #[test]
-fn openid4vp_scope_based_dcql_is_gated() {
+fn openid4vp_response_type_is_gated() {
+    let store = test_store();
+    let request = json!({
+        "requests": [{
+            "protocol": PROTOCOL_OPENID4VP_V1_UNSIGNED,
+            "data": {
+                "response_type": "id_token",
+                "dcql_query": {
+                    "credentials": [
+                        { "id": "pid", "format": "dc+sd-jwt", "meta": { "vct_values": ["vct:pid"] } }
+                    ]
+                }
+            }
+        }]
+    })
+    .to_string();
+
+    let response = match_dc_api_request(&request, &store, &MatcherOptions::default()).unwrap();
+    assert!(response.results.is_empty());
+
+    let request = json!({
+        "requests": [{
+            "protocol": PROTOCOL_OPENID4VP_V1_UNSIGNED,
+            "data": {
+                "response_type": RESPONSE_TYPE_VP_TOKEN,
+                "dcql_query": {
+                    "credentials": [
+                        { "id": "pid", "format": "dc+sd-jwt", "meta": { "vct_values": ["vct:pid"] } }
+                    ]
+                }
+            }
+        }]
+    })
+    .to_string();
+
+    let response = match_dc_api_request(&request, &store, &MatcherOptions::default()).unwrap();
+    assert!(!response.results.is_empty());
+}
+
+#[test]
+fn openid4vp_scope_based_dcql_is_ignored_when_unsupported() {
     let store = test_store();
     let request = json!({
         "requests": [{
@@ -1111,30 +1296,13 @@ fn openid4vp_scope_based_dcql_is_gated() {
     })
     .to_string();
 
-    let vp_config = dcapi_matcher::OpenId4VpConfig {
-        enabled: true,
-        allow_dcql: true,
-        allow_dcql_scope: false,
-        allow_transaction_data: true,
-        allow_signed_requests: false,
-        allow_response_mode_jwt: false,
-    };
+    let vp_config = dcapi_matcher::OpenId4VpConfig::openid4vp1();
     let wrapped = VpOverride {
         inner: &store,
         config: vp_config,
     };
     let response = match_dc_api_request(&request, &wrapped, &MatcherOptions::default()).unwrap();
     assert!(response.results.is_empty());
-
-    let wrapped = VpOverride {
-        inner: &store,
-        config: dcapi_matcher::OpenId4VpConfig {
-            allow_dcql_scope: true,
-            ..vp_config
-        },
-    };
-    let err = match_dc_api_request(&request, &wrapped, &MatcherOptions::default()).unwrap_err();
-    assert!(matches!(err, MatcherError::InvalidOpenId4Vp(_)));
 }
 
 #[test]
@@ -1253,7 +1421,11 @@ fn openid4vp_zk_format_falls_back_to_non_zk_option() {
     .to_string();
 
     let response = match_dc_api_request(&request, &store, &MatcherOptions::default()).unwrap();
-    assert_eq!(response.results.len(), 1, "expected exactly one result group");
+    assert_eq!(
+        response.results.len(),
+        1,
+        "expected exactly one result group"
+    );
 
     let MatcherResult::Group(set) = &response.results[0] else {
         panic!("expected group");
@@ -1265,7 +1437,11 @@ fn openid4vp_zk_format_falls_back_to_non_zk_option() {
         .iter()
         .filter_map(|entry| entry_cred_id(entry).to_str().ok())
         .collect();
-    assert_eq!(alt_ids, vec!["age-mdoc-1"], "only the non-zk mdoc credential should match");
+    assert_eq!(
+        alt_ids,
+        vec!["age-mdoc-1"],
+        "only the non-zk mdoc credential should match"
+    );
 }
 
 #[test]

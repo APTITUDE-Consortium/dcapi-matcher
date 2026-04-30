@@ -21,10 +21,7 @@ impl<'a> Field<'a> {
         }
     }
 
-    pub fn from_cow(
-        display_name: Cow<'a, CStr>,
-        display_value: Option<Cow<'a, CStr>>,
-    ) -> Self {
+    pub fn from_cow(display_name: Cow<'a, CStr>, display_value: Option<Cow<'a, CStr>>) -> Self {
         Self {
             display_name,
             display_value,

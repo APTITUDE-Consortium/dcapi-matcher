@@ -1,18 +1,36 @@
 use dcapi_dcql::{
-    ClaimValue, CredentialFormat, CredentialSetOptionMode, CredentialStore, DcqlOutput, DcqlQuery,
+    ClaimValue, CredentialFormat, CredentialStore, DEFAULT_TS12_PREFIX, DcqlOutput,
     OptionalCredentialSetsMode, PlanError, PlanOptions, TransactionData, TransactionDataType,
     TrustedAuthority, ValueMatch, plan_selection,
 };
-use serde::Deserialize;
-use serde_json::{Map, Value};
 use rustc_hash::FxHashMap;
-use std::collections::BTreeSet;
-use std::fs;
-use std::path::{Path, PathBuf};
+use serde::Deserialize;
+use serde_json::{Map, Value, json};
 
-// -----------------------------
-// JSON credential package model
-// -----------------------------
+macro_rules! ts12_sca_type {
+    ($suffix:literal) => {
+        concat!("urn:eudi:sca:", $suffix)
+    };
+}
+
+const SCA_PAY_V1: &str = ts12_sca_type!("example.pay:transaction:1");
+const SCA_PAY_V2: &str = ts12_sca_type!("example.pay:transaction:2");
+const SCA_CARD: &str = ts12_sca_type!("example.pay:card:1");
+const SCA_ACCOUNT: &str = ts12_sca_type!("example.pay:account:1");
+const OTHER_TD: &str = "urn:example:non-sca:receipt:1";
+const OTHER_ACCOUNT_TD: &str = "urn:example:non-sca:account:1";
+
+// Spec coverage map:
+// - OID4VP 6.1: duplicate ids are ignored after first; unknown formats do not kill satisfiable options.
+// - OID4VP 6.2: omitted credential_sets means all credentials are required.
+// - OID4VP 6.3/6.4.1: claims, claim_sets, claim paths, value filters.
+// - OID4VP transaction_data: malformed entries are ignored; usable ids target DCQL queries.
+// - TS12 3.3: each candidate credential selects the first compatible targeted entry.
+// - TS12 3.3: incompatible payloads are skipped, then the next entry is tried.
+// - TS12 3.4: SCA-targeted credential set alternatives must be transposable.
+// - TS12 3.4: non-SCA transaction_data entries are not subject to SCA-only constraints.
+// - TS12 3.4: alternatives resolving to different transaction_data keep that binding per option.
+// - TS12 3.4: per-slot display order/default follows the alternatives' first appearances.
 
 #[derive(Debug, Clone, Deserialize)]
 struct CredentialPackage {
@@ -37,6 +55,9 @@ struct JsonCredential {
     #[serde(default)]
     transaction_data_types: Vec<TransactionDataType>,
 
+    #[serde(default)]
+    accepted_transaction_payload_kinds: Vec<String>,
+
     #[serde(default = "default_claims_value")]
     claims: Value,
 }
@@ -48,13 +69,9 @@ fn default_claims_value() -> Value {
 #[derive(Debug, Clone, Deserialize)]
 struct RequestFixture {
     #[serde(flatten)]
-    dcql_query: DcqlQuery,
+    dcql_query: dcapi_dcql::DcqlQuery,
     transaction_data: Option<Vec<TransactionData>>,
 }
-
-// -----------------------------
-// Minimal JSON-backed store impl
-// -----------------------------
 
 #[derive(Debug, Clone)]
 struct JsonStore {
@@ -105,12 +122,10 @@ impl CredentialStore for JsonStore {
         let Some(current_vct) = c.vct.as_deref() else {
             return false;
         };
-        if current_vct == vct {
-            return true;
-        }
-        c.extends_vcts
-            .as_ref()
-            .is_some_and(|chain| chain.iter().any(|entry| entry == vct))
+        current_vct == vct
+            || c.extends_vcts
+                .as_ref()
+                .is_some_and(|chain| chain.iter().any(|entry| entry == vct))
     }
 
     fn supports_holder_binding(&self, cred: &Self::CredentialRef) -> bool {
@@ -124,12 +139,31 @@ impl CredentialStore for JsonStore {
     fn can_sign_transaction_data(
         &self,
         cred: &Self::CredentialRef,
-        transaction_data: &dcapi_dcql::TransactionData,
+        transaction_data: &TransactionData,
     ) -> bool {
-        self.get(cred)
+        let c = self.get(cred);
+        let type_matches = c
             .transaction_data_types
             .iter()
-            .any(|t| t.r#type == transaction_data.r#type)
+            .any(|t| t.r#type == transaction_data.r#type);
+        if !type_matches {
+            return false;
+        }
+
+        if c.accepted_transaction_payload_kinds.is_empty() {
+            return true;
+        }
+
+        transaction_data
+            .extra
+            .get("payload")
+            .and_then(|payload| payload.get("kind"))
+            .and_then(Value::as_str)
+            .is_some_and(|kind| {
+                c.accepted_transaction_payload_kinds
+                    .iter()
+                    .any(|accepted| accepted == kind)
+            })
     }
 
     fn has_claim_path(
@@ -137,8 +171,7 @@ impl CredentialStore for JsonStore {
         cred: &Self::CredentialRef,
         path: &dcapi_dcql::ClaimsPathPointer,
     ) -> bool {
-        let c = self.get(cred);
-        dcapi_dcql::select_nodes(&c.claims, path).is_ok()
+        dcapi_dcql::select_nodes(&self.get(cred).claims, path).is_ok()
     }
 
     fn match_claim_value(
@@ -147,19 +180,19 @@ impl CredentialStore for JsonStore {
         path: &dcapi_dcql::ClaimsPathPointer,
         expected_values: &[ClaimValue],
     ) -> ValueMatch {
-        let c = self.get(cred);
-        let Ok(nodes) = dcapi_dcql::select_nodes(&c.claims, path) else {
+        let Ok(nodes) = dcapi_dcql::select_nodes(&self.get(cred).claims, path) else {
             return ValueMatch::NoMatch;
         };
-        for node in nodes {
-            if expected_values
-                .iter()
-                .any(|value| claim_value_matches_json(value, node))
-            {
-                return ValueMatch::Match;
-            }
-        }
-        ValueMatch::NoMatch
+
+        nodes
+            .iter()
+            .any(|node| {
+                expected_values
+                    .iter()
+                    .any(|value| claim_value_matches_json(value, node))
+            })
+            .then_some(ValueMatch::Match)
+            .unwrap_or(ValueMatch::NoMatch)
     }
 
     fn matches_trusted_authorities(
@@ -167,497 +200,253 @@ impl CredentialStore for JsonStore {
         cred: &Self::CredentialRef,
         trusted_authorities: &[TrustedAuthority],
     ) -> bool {
-        if trusted_authorities.is_empty() {
-            return true;
-        }
         let c = self.get(cred);
-        for ta in trusted_authorities {
-            // A credential matches a TrustedAuthority constraint if it has *any* entry
-            // of the same type, with at least one overlapping value.
-            let matches = c.trusted_authorities.iter().any(|cred_ta| {
+        trusted_authorities.iter().all(|ta| {
+            c.trusted_authorities.iter().any(|cred_ta| {
                 cred_ta.r#type == ta.r#type && cred_ta.values.iter().any(|v| ta.values.contains(v))
-            });
-            if !matches {
-                return false;
-            }
-        }
-        true
+            })
+        })
     }
-
-    // `match_claims` uses the library default implementation (DCQL engine).
 }
 
-// -----------------------------
-// Expected output JSON model
-// -----------------------------
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "result", rename_all = "lowercase")]
-enum Expected {
-    Plan {
-        presentation_sets: Vec<Vec<SlotExpectation>>,
-    },
-    Error {
-        error: String,
-        #[serde(default)]
-        message: Option<String>,
-    },
-    #[serde(rename = "parse_error")]
-    ParseError {
-        #[serde(default)]
-        message: Option<String>,
-    },
-}
-
-#[derive(Debug, Deserialize)]
-struct SlotExpectation {
-    #[serde(default)]
-    transaction_data_ids: Vec<usize>,
-    alternatives: Vec<SelectionExpectation>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SelectionExpectation {
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct AltSummary {
     dcql_id: String,
-    #[serde(default)]
     credential_id: Option<String>,
-    #[serde(default)]
     selected_claim_ids: Vec<String>,
+    transaction_data_ids: Vec<usize>,
 }
 
-// -----------------------------
-// Tests
-// -----------------------------
+type SlotSummary = Vec<AltSummary>;
+type SetSummary = Vec<SlotSummary>;
+type PlanSummary = Vec<SetSummary>;
 
-macro_rules! case_test {
-    ($name:ident, $dir:literal) => {
-        #[test]
-        fn $name() {
-            let case_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("tests")
-                .join("cases")
-                .join($dir);
-            run_case(&case_dir);
-        }
-    };
+fn parse_request(value: Value) -> RequestFixture {
+    serde_json::from_value(value).expect("request fixture must deserialize")
 }
 
-case_test!(
-    case_01_no_credential_sets_all_required,
-    "01_no_credential_sets_all_required"
-);
-case_test!(
-    case_02_required_sets_factorization_optional,
-    "02_required_sets_factorization_optional"
-);
-case_test!(
-    case_03_conditional_outer_alternatives,
-    "03_conditional_outer_alternatives"
-);
-case_test!(case_04_unsatisfied_due_to_vct, "04_unsatisfied_due_to_vct");
-case_test!(
-    case_05_invalid_claim_sets_without_claims,
-    "05_invalid_claim_sets_without_claims"
-);
-case_test!(
-    case_06_invalid_claim_sets_missing_claim_id,
-    "06_invalid_claim_sets_missing_claim_id"
-);
-case_test!(
-    case_07_claim_sets_select_second_option,
-    "07_claim_sets_select_second_option"
-);
-case_test!(case_08_values_filtering, "08_values_filtering");
-case_test!(
-    case_09_mdoc_invalid_claim_path_unsatisfied,
-    "09_mdoc_invalid_claim_path_unsatisfied"
-);
-case_test!(
-    case_10_trusted_authorities_filtering,
-    "10_trusted_authorities_filtering"
-);
-case_test!(
-    case_11_holder_binding_required_default,
-    "11_holder_binding_required_default"
-);
-case_test!(
-    case_12_holder_binding_not_required_allows,
-    "12_holder_binding_not_required_allows"
-);
-case_test!(
-    case_13_vct_extends_chain_matches,
-    "13_vct_extends_chain_matches"
-);
-case_test!(
-    case_14_optional_set_only_allows_empty,
-    "14_optional_set_only_allows_empty"
-);
-case_test!(
-    case_15_optional_dedup_when_option_is_forced,
-    "15_optional_dedup_when_option_is_forced"
-);
-case_test!(
-    case_16_mismatched_meta_for_special_format_rejects,
-    "16_mismatched_meta_for_special_format_rejects"
-);
-case_test!(
-    case_17_meta_other_allows_any_format,
-    "17_meta_other_allows_any_format"
-);
-case_test!(
-    case_18_sdjwt_meta_on_other_format_allowed,
-    "18_sdjwt_meta_on_other_format_allowed"
-);
-case_test!(
-    case_19_empty_credentials_invalid,
-    "19_empty_credentials_invalid"
-);
-case_test!(case_20_empty_option_ignored, "20_empty_option_ignored");
-case_test!(
-    case_21_empty_claim_path_filters_out,
-    "21_empty_claim_path_filters_out"
-);
-case_test!(
-    case_22_transaction_data_single_id_match,
-    "22_transaction_data_single_id_match"
-);
-case_test!(
-    case_23_transaction_data_single_id_no_match_unsatisfied,
-    "23_transaction_data_single_id_no_match_unsatisfied"
-);
-case_test!(
-    case_24_transaction_data_single_id_multiple_types_all_required,
-    "24_transaction_data_single_id_multiple_types_all_required"
-);
-case_test!(
-    case_25_transaction_data_single_id_missing_second_unsatisfied,
-    "25_transaction_data_single_id_missing_second_unsatisfied"
-);
-case_test!(
-    case_26_transaction_data_multi_id_filters_configs,
-    "26_transaction_data_multi_id_filters_configs"
-);
-case_test!(
-    case_27_transaction_data_multi_id_none_match_unsatisfied,
-    "27_transaction_data_multi_id_none_match_unsatisfied"
-);
-case_test!(
-    case_28_transaction_data_subtype_match,
-    "28_transaction_data_subtype_match"
-);
-case_test!(
-    case_29_transaction_data_subtype_mismatch_unsatisfied,
-    "29_transaction_data_subtype_mismatch_unsatisfied"
-);
-case_test!(
-    case_30_transaction_data_empty_credential_ids_invalid,
-    "30_transaction_data_empty_credential_ids_invalid"
-);
-case_test!(
-    case_31_transaction_data_unknown_credential_id_invalid,
-    "31_transaction_data_unknown_credential_id_invalid"
-);
-case_test!(
-    case_32_transaction_data_multiple_constraints_filter,
-    "32_transaction_data_multiple_constraints_filter"
-);
-case_test!(
-    case_33_transaction_data_empty_array_ignored,
-    "33_transaction_data_empty_array_ignored"
-);
-case_test!(
-    case_34_transaction_data_affects_claim_sets_selection,
-    "34_transaction_data_affects_claim_sets_selection"
-);
-case_test!(
-    case_35_transaction_data_singleton_option_prunes_candidates,
-    "35_transaction_data_singleton_option_prunes_candidates"
-);
-case_test!(
-    case_36_unknown_format_is_ignored,
-    "36_unknown_format_is_ignored"
-);
-case_test!(
-    case_37_transaction_data_requires_consistent_credential_per_id,
-    "37_transaction_data_requires_consistent_credential_per_id"
-);
-case_test!(
-    case_38_mdoc_meta_optional_broad_match,
-    "38_mdoc_meta_optional_broad_match"
-);
-case_test!(
-    case_39_transaction_data_requires_holder_binding,
-    "39_transaction_data_requires_holder_binding"
-);
-case_test!(
-    case_40_sdjwt_meta_unknown_fields_ignored,
-    "40_sdjwt_meta_unknown_fields_ignored"
-);
-case_test!(
-    case_41_transaction_data_overlap_single_keeps_other_unconstrained,
-    "41_transaction_data_overlap_single_keeps_other_unconstrained"
-);
-case_test!(
-    case_42_transaction_data_overlap_multi_assignment_domains,
-    "42_transaction_data_overlap_multi_assignment_domains"
-);
-case_test!(
-    case_43_options_required_disjunction_matrix,
-    "43_options_required_disjunction_matrix"
-);
-case_test!(
-    case_44_options_optional_set_matrix,
-    "44_options_optional_set_matrix"
-);
-case_test!(
-    case_45_options_optional_multi_option_matrix,
-    "45_options_optional_multi_option_matrix"
-);
-case_test!(
-    case_46_single_set_single_query_multiple_candidates,
-    "46_single_set_single_query_multiple_candidates"
-);
-case_test!(
-    case_47_single_set_two_options_multi_format,
-    "47_single_set_two_options_multi_format"
-);
-
-fn run_case(case_dir: &Path) {
-    let request_path = case_dir.join("request.json");
-    let credentials_path = case_dir.join("credentials.json");
-    let expected_path = case_dir.join("expected.json");
-
-    let expected: Expected = read_json(&expected_path);
-    let request_text = fs::read_to_string(&request_path)
-        .unwrap_or_else(|e| panic!("failed to read {request_path:?}: {e}"));
-    let request_result = serde_json::from_str::<RequestFixture>(&request_text);
-
-    let request = match request_result {
-        Ok(request) => {
-            if let Expected::ParseError { message } = &expected {
-                panic!(
-                    "{case_dir:?}: expected parse error {:?} but request parsed successfully",
-                    message
-                );
-            }
-            request
-        }
-        Err(err) => {
-            if let Expected::ParseError { message } = &expected {
-                assert_parse_error(case_dir, &err, message.as_deref());
-                return;
-            }
-            panic!("failed to parse {request_path:?} as RequestFixture: {err}\n{request_text}");
-        }
-    };
-
-    let pkg: CredentialPackage = read_json(&credentials_path);
-
-    let store = JsonStore::from_package(pkg);
-
-    assert_outcome_with_expected(
-        case_dir,
-        &request,
-        &store,
-        &PlanOptions::default(),
-        expected,
-    );
-    assert_option_matrix_if_present(case_dir, &request, &store);
+fn request_parse_error(value: Value) -> String {
+    serde_json::from_value::<RequestFixture>(value)
+        .expect_err("request fixture must fail to deserialize")
+        .to_string()
 }
 
-fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> T {
-    let text = fs::read_to_string(path).unwrap_or_else(|e| panic!("failed to read {path:?}: {e}"));
-    serde_json::from_str(&text)
-        .unwrap_or_else(|e| panic!("failed to parse {path:?} as json: {e}\n{text}"))
+fn store(value: Value) -> JsonStore {
+    JsonStore::from_package(serde_json::from_value(value).expect("credential package must parse"))
 }
 
-const OPTION_COMBINATIONS: [(&str, PlanOptions); 6] = [
-    (
-        "all_satisfiable.prefer_present",
-        PlanOptions {
-            credential_set_option_mode: CredentialSetOptionMode::AllSatisfiable,
-            optional_credential_sets_mode: OptionalCredentialSetsMode::PreferPresent,
-        },
-    ),
-    (
-        "all_satisfiable.prefer_absent",
-        PlanOptions {
-            credential_set_option_mode: CredentialSetOptionMode::AllSatisfiable,
-            optional_credential_sets_mode: OptionalCredentialSetsMode::PreferAbsent,
-        },
-    ),
-    (
-        "all_satisfiable.always_present_if_satisfiable",
-        PlanOptions {
-            credential_set_option_mode: CredentialSetOptionMode::AllSatisfiable,
-            optional_credential_sets_mode: OptionalCredentialSetsMode::AlwaysPresentIfSatisfiable,
-        },
-    ),
-    (
-        "first_satisfiable_only.prefer_present",
-        PlanOptions {
-            credential_set_option_mode: CredentialSetOptionMode::FirstSatisfiableOnly,
-            optional_credential_sets_mode: OptionalCredentialSetsMode::PreferPresent,
-        },
-    ),
-    (
-        "first_satisfiable_only.prefer_absent",
-        PlanOptions {
-            credential_set_option_mode: CredentialSetOptionMode::FirstSatisfiableOnly,
-            optional_credential_sets_mode: OptionalCredentialSetsMode::PreferAbsent,
-        },
-    ),
-    (
-        "first_satisfiable_only.always_present_if_satisfiable",
-        PlanOptions {
-            credential_set_option_mode: CredentialSetOptionMode::FirstSatisfiableOnly,
-            optional_credential_sets_mode: OptionalCredentialSetsMode::AlwaysPresentIfSatisfiable,
-        },
-    ),
-];
-
-fn option_expected_path(case_dir: &Path, slug: &str) -> PathBuf {
-    case_dir.join(format!("expected.option.{slug}.json"))
+fn plan_ok(request: Value, credentials: Value) -> DcqlOutput<String> {
+    plan_ok_with_options(request, credentials, PlanOptions::default())
 }
 
-fn assert_option_matrix_if_present(case_dir: &Path, request: &RequestFixture, store: &JsonStore) {
-    let present = OPTION_COMBINATIONS
-        .iter()
-        .filter(|(slug, _)| option_expected_path(case_dir, slug).exists())
-        .count();
-
-    if present == 0 {
-        return;
-    }
-
-    assert_eq!(
-        present,
-        OPTION_COMBINATIONS.len(),
-        "{case_dir:?}: option matrix is partial; provide all {} expected.option.*.json files",
-        OPTION_COMBINATIONS.len()
-    );
-
-    for (slug, options) in OPTION_COMBINATIONS {
-        let expected_path = option_expected_path(case_dir, slug);
-        let expected: Expected = read_json(&expected_path);
-        if matches!(expected, Expected::ParseError { .. }) {
-            panic!(
-                "{case_dir:?}: parse_error is not valid for option matrix file {expected_path:?}"
-            );
-        }
-        assert_outcome_with_expected(case_dir, request, store, &options, expected);
-    }
-}
-
-fn assert_outcome_with_expected(
-    case_dir: &Path,
-    request: &RequestFixture,
-    store: &JsonStore,
-    options: &PlanOptions,
-    expected: Expected,
-) {
-    let actual = plan_selection(
+fn plan_ok_with_options(
+    request: Value,
+    credentials: Value,
+    options: PlanOptions,
+) -> DcqlOutput<String> {
+    let request = parse_request(request);
+    let store = store(credentials);
+    plan_selection(
         &request.dcql_query,
         request.transaction_data.as_deref(),
-        store,
-        options,
-    );
-
-    match (actual, expected) {
-        (
-            Ok(plan),
-            Expected::Plan {
-                presentation_sets,
-            },
-        ) => {
-            assert_plan(
-                case_dir,
-                &request.dcql_query,
-                request.transaction_data.as_deref(),
-                &plan,
-                &presentation_sets,
-            );
-        }
-        (Err(err), Expected::Error { error, message }) => {
-            assert_error(case_dir, err, &error, message.as_deref());
-        }
-        (Ok(plan), Expected::Error { error, .. }) => {
-            panic!(
-                "{case_dir:?}: expected error {error:?} but got plan with {} outer alternatives",
-                plan.presentation_sets.len()
-            );
-        }
-        (Err(err), Expected::Plan { .. }) => {
-            panic!("{case_dir:?}: expected plan but got error: {err:?}");
-        }
-        (_, Expected::ParseError { message }) => {
-            panic!(
-                "{case_dir:?}: expected parse error {:?} but query parsed and planner ran",
-                message
-            );
-        }
-    }
+        &store,
+        &options,
+    )
+    .expect("expected satisfiable plan")
 }
 
-fn assert_error(case_dir: &Path, err: PlanError, expected_err: &str, expected_msg: Option<&str>) {
+fn plan_err(request: Value, credentials: Value) -> PlanError {
+    let request = parse_request(request);
+    let store = store(credentials);
+    plan_selection(
+        &request.dcql_query,
+        request.transaction_data.as_deref(),
+        &store,
+        &PlanOptions::default(),
+    )
+    .expect_err("expected planner error")
+}
+
+fn assert_invalid_query(err: PlanError, expected: &str) {
     match err {
-        PlanError::Unsatisfied => {
-            assert_eq!(
-                expected_err, "Unsatisfied",
-                "{case_dir:?}: wrong error kind"
-            );
-        }
-        PlanError::InvalidQuery(msg) => {
-            assert_eq!(
-                expected_err, "InvalidQuery",
-                "{case_dir:?}: wrong error kind"
-            );
-            if let Some(expected) = expected_msg {
-                assert_eq!(msg, expected, "{case_dir:?}: wrong invalid query message");
-            }
-        }
+        PlanError::InvalidQuery(message) => assert!(
+            message.contains(expected),
+            "expected invalid query containing {expected:?}, got {message:?}"
+        ),
+        other => panic!("expected InvalidQuery, got {other:?}"),
     }
 }
 
-fn assert_parse_error(case_dir: &Path, err: &serde_json::Error, expected_msg: Option<&str>) {
-    if let Some(expected) = expected_msg {
-        assert!(
-            err.to_string().contains(expected),
-            "{case_dir:?}: parse error mismatch, expected substring {expected:?}, got {err}"
-        );
+fn assert_unsatisfied(err: PlanError) {
+    assert!(
+        matches!(err, PlanError::Unsatisfied),
+        "expected Unsatisfied, got {err:?}"
+    );
+}
+
+fn assert_plan(plan: &DcqlOutput<String>, expected: PlanSummary) {
+    assert_eq!(summarize_plan(plan), canonicalize_expected(expected));
+}
+
+fn summarize_plan(plan: &DcqlOutput<String>) -> PlanSummary {
+    let mut sets = plan
+        .presentation_sets
+        .iter()
+        .map(|set| {
+            let mut slots = set
+                .iter()
+                .map(|slot| {
+                    let mut alternatives = slot
+                        .alternatives
+                        .iter()
+                        .map(|selection| {
+                            let mut selected_claim_ids = selection
+                                .selected_claims
+                                .iter()
+                                .filter_map(|claim| claim.id.clone())
+                                .collect::<Vec<_>>();
+                            selected_claim_ids.sort();
+
+                            let mut transaction_data_ids = selection.transaction_data_ids.clone();
+                            transaction_data_ids.sort_unstable();
+
+                            AltSummary {
+                                dcql_id: selection.dcql_id.clone(),
+                                credential_id: selection.credential_id.clone(),
+                                selected_claim_ids,
+                                transaction_data_ids: transaction_data_ids.clone(),
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    alternatives.sort();
+                    alternatives
+                })
+                .collect::<Vec<_>>();
+            slots.sort();
+            slots
+        })
+        .collect::<Vec<_>>();
+    sets.sort();
+    sets
+}
+
+fn canonicalize_expected(mut expected: PlanSummary) -> PlanSummary {
+    for set in &mut expected {
+        for slot in set.iter_mut() {
+            for alt in slot.iter_mut() {
+                alt.selected_claim_ids.sort();
+                alt.transaction_data_ids.sort_unstable();
+            }
+            slot.sort();
+        }
+        set.sort();
+    }
+    expected.sort();
+    expected
+}
+
+fn alt(dcql_id: &str, credential_id: &str) -> AltSummary {
+    alt_claims_tx(dcql_id, Some(credential_id), &[], &[])
+}
+
+fn alt_tx(dcql_id: &str, credential_id: &str, transaction_data_ids: &[usize]) -> AltSummary {
+    alt_claims_tx(dcql_id, Some(credential_id), &[], transaction_data_ids)
+}
+
+fn alt_claims(dcql_id: &str, credential_id: &str, selected_claim_ids: &[&str]) -> AltSummary {
+    alt_claims_tx(dcql_id, Some(credential_id), selected_claim_ids, &[])
+}
+
+fn alt_claims_tx(
+    dcql_id: &str,
+    credential_id: Option<&str>,
+    selected_claim_ids: &[&str],
+    transaction_data_ids: &[usize],
+) -> AltSummary {
+    AltSummary {
+        dcql_id: dcql_id.to_string(),
+        credential_id: credential_id.map(ToString::to_string),
+        selected_claim_ids: selected_claim_ids
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect(),
+        transaction_data_ids: transaction_data_ids.to_vec(),
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn assert_plan(
-    case_dir: &Path,
-    _request: &DcqlQuery,
-    expected_transaction_data: Option<&[TransactionData]>,
-    plan: &DcqlOutput<String>,
-    expected_presentation_sets: &[Vec<SlotExpectation>],
-) {
-    assert_presentation_sets(case_dir, plan, expected_presentation_sets);
+fn none(dcql_id: &str) -> AltSummary {
+    alt_claims_tx(dcql_id, None, &[], &[])
+}
 
-    // Verify transaction-data bindings are coherent with entries and fully assigned.
-    let expected_transaction_data_len = expected_transaction_data.map_or(0, |data| data.len());
-    for set in &plan.presentation_sets {
-        let mut covered = BTreeSet::new();
-        for slot in set {
-            for index in &slot.transaction_data_ids {
-                assert!(
-                    *index < expected_transaction_data_len,
-                    "{case_dir:?}: transaction_data index {} out of bounds",
-                    index
-                );
-                covered.insert(*index);
-            }
-        }
-        assert_eq!(
-            covered.len(),
-            expected_transaction_data_len,
-            "{case_dir:?}: each presentation set must cover all transaction_data entries"
-        );
-    }
+fn sd_query(id: &str, vct: &str) -> Value {
+    json!({ "id": id, "format": "dc+sd-jwt", "meta": { "vct_values": [vct] } })
+}
+
+fn sd_query_without_holder_binding(id: &str, vct: &str) -> Value {
+    json!({
+        "id": id,
+        "format": "dc+sd-jwt",
+        "meta": { "vct_values": [vct] },
+        "require_cryptographic_holder_binding": false
+    })
+}
+
+fn mdoc_query(id: &str, doctype: &str) -> Value {
+    json!({ "id": id, "format": "mso_mdoc", "meta": { "doctype_value": doctype } })
+}
+
+fn sd_credential(id: &str, vct: &str) -> Value {
+    json!({
+        "id": id,
+        "format": "dc+sd-jwt",
+        "holder_binding": true,
+        "vct": vct,
+        "claims": {}
+    })
+}
+
+fn sd_credential_without_holder_binding(id: &str, vct: &str) -> Value {
+    json!({
+        "id": id,
+        "format": "dc+sd-jwt",
+        "holder_binding": false,
+        "vct": vct,
+        "claims": {}
+    })
+}
+
+fn mdoc_credential(id: &str, doctype: &str) -> Value {
+    json!({
+        "id": id,
+        "format": "mso_mdoc",
+        "doctype": doctype,
+        "claims": {}
+    })
+}
+
+fn with_transaction_types(mut credential: Value, types: &[&str]) -> Value {
+    credential["transaction_data_types"] = Value::Array(
+        types
+            .iter()
+            .map(|r#type| json!({ "type": *r#type }))
+            .collect(),
+    );
+    credential
+}
+
+fn with_accepted_payload_kinds(mut credential: Value, kinds: &[&str]) -> Value {
+    credential["accepted_transaction_payload_kinds"] =
+        Value::Array(kinds.iter().map(|kind| json!(*kind)).collect());
+    credential
+}
+
+fn with_claims(mut credential: Value, claims: Value) -> Value {
+    credential["claims"] = claims;
+    credential
+}
+
+fn package(credentials: Vec<Value>) -> Value {
+    json!({ "credentials": credentials })
 }
 
 fn claim_value_matches_json(expected: &ClaimValue, actual: &Value) -> bool {
@@ -668,110 +457,863 @@ fn claim_value_matches_json(expected: &ClaimValue, actual: &Value) -> bool {
     }
 }
 
-fn assert_presentation_sets(
-    case_dir: &Path,
-    plan: &DcqlOutput<String>,
-    expected: &[Vec<SlotExpectation>],
-) {
-    let mut actual = plan
-        .presentation_sets
-        .iter()
-        .map(|set| canonicalize_actual_set(set))
-        .collect::<Vec<_>>();
-    actual.sort();
+mod oid4vp_query_structure {
+    use super::*;
 
-    let mut expected = expected
-        .iter()
-        .map(|set| canonicalize_expected_set(set))
-        .collect::<Vec<_>>();
-    expected.sort();
+    #[test]
+    fn default_options_target_ts12_sca_prefix_only() {
+        let options = PlanOptions::default();
 
-    assert_eq!(
-        actual, expected,
-        "{case_dir:?}: presentation_sets mismatch with expected"
-    );
+        assert_eq!(options.ts12_prefixes, vec![DEFAULT_TS12_PREFIX.to_string()]);
+        assert!(options.is_ts12_transaction_data_type(SCA_PAY_V1));
+        assert!(options.is_ts12_transaction_data_type(SCA_PAY_V2));
+        assert!(options.is_ts12_transaction_data_type(SCA_CARD));
+        assert!(options.is_ts12_transaction_data_type(SCA_ACCOUNT));
+        assert!(!options.is_ts12_transaction_data_type(OTHER_TD));
+        assert!(!options.is_ts12_transaction_data_type(OTHER_ACCOUNT_TD));
+    }
+
+    #[test]
+    fn targeted_transaction_data_prefixes_are_configurable() {
+        let options = PlanOptions {
+            ts12_prefixes: vec!["urn:bank-a:sca:".to_string(), "urn:bank-b:sca:".to_string()],
+            ..PlanOptions::default()
+        };
+
+        assert!(options.is_ts12_transaction_data_type("urn:bank-a:sca:payment:1"));
+        assert!(options.is_ts12_transaction_data_type("urn:bank-b:sca:card:1"));
+        assert!(!options.is_ts12_transaction_data_type(SCA_CARD));
+        assert!(!options.is_ts12_transaction_data_type("urn:bank-c:sca:payment:1"));
+    }
+
+    #[test]
+    fn empty_targeted_transaction_data_prefixes_disable_targeted_matching() {
+        let options = PlanOptions {
+            ts12_prefixes: Vec::new(),
+            ..PlanOptions::default()
+        };
+
+        assert!(!options.is_ts12_transaction_data_type(SCA_PAY_V1));
+    }
+
+    #[test]
+    fn credentials_array_must_not_be_empty() {
+        let err = request_parse_error(json!({ "credentials": [] }));
+        assert!(err.contains("credentials must contain at least one credential query"));
+    }
+
+    #[test]
+    fn duplicate_credential_query_ids_are_ignored_after_first() {
+        let plan = plan_ok(
+            json!({
+                "credentials": [
+                    sd_query("pid", "vct:pid"),
+                    mdoc_query("pid", "org.iso.18013.5.1.mDL")
+                ]
+            }),
+            package(vec![
+                sd_credential("sd-pid", "vct:pid"),
+                mdoc_credential("mdl", "org.iso.18013.5.1.mDL"),
+            ]),
+        );
+
+        assert_plan(&plan, vec![vec![vec![alt("pid", "sd-pid")]]]);
+    }
+
+    #[test]
+    fn claim_sets_without_claims_are_ignored() {
+        let plan = plan_ok(
+            json!({
+                "credentials": [{
+                    "id": "pid",
+                    "format": "dc+sd-jwt",
+                    "meta": { "vct_values": ["vct:pid"] },
+                    "claim_sets": [["given_name"]]
+                }]
+            }),
+            package(vec![sd_credential("sd-pid", "vct:pid")]),
+        );
+
+        assert_plan(&plan, vec![vec![vec![alt("pid", "sd-pid")]]]);
+    }
+
+    #[test]
+    fn unknown_format_option_is_pruned_without_rejecting_supported_option() {
+        let plan = plan_ok(
+            json!({
+                "credentials": [
+                    { "id": "future", "format": "dc+future", "meta": {} },
+                    sd_query("pid", "vct:pid")
+                ],
+                "credential_sets": [{ "options": [["future"], ["pid"]] }]
+            }),
+            package(vec![sd_credential("sd-pid", "vct:pid")]),
+        );
+
+        assert_plan(&plan, vec![vec![vec![alt("pid", "sd-pid")]]]);
+    }
 }
 
-fn canonicalize_actual_set(set: &[dcapi_dcql::SetAlternative<String>]) -> String {
-    let mut slot_parts = set
-        .iter()
-        .map(canonicalize_actual_slot)
-        .collect::<Vec<_>>();
-    slot_parts.sort();
-    slot_parts.join("||")
+mod credential_matching {
+    use super::*;
+
+    #[test]
+    fn sd_jwt_requires_holder_binding_by_default() {
+        let err = plan_err(
+            json!({ "credentials": [sd_query("pid", "vct:pid")] }),
+            package(vec![sd_credential_without_holder_binding(
+                "sd-pid", "vct:pid",
+            )]),
+        );
+
+        assert_unsatisfied(err);
+    }
+
+    #[test]
+    fn sd_jwt_holder_binding_requirement_can_be_disabled_without_transaction_data() {
+        let plan = plan_ok(
+            json!({ "credentials": [sd_query_without_holder_binding("pid", "vct:pid")] }),
+            package(vec![sd_credential_without_holder_binding(
+                "sd-pid", "vct:pid",
+            )]),
+        );
+
+        assert_plan(&plan, vec![vec![vec![alt("pid", "sd-pid")]]]);
+    }
+
+    #[test]
+    fn sd_jwt_vct_values_match_direct_or_extends_chain() {
+        let mut direct = sd_credential("direct", "vct:pid");
+        let mut child = sd_credential("child", "vct:pid-child");
+        child["extends_vcts"] = json!(["vct:pid"]);
+        direct["claims"] = json!({ "given_name": "Alice" });
+        child["claims"] = json!({ "given_name": "Alice" });
+
+        let plan = plan_ok(
+            json!({ "credentials": [sd_query("pid", "vct:pid")] }),
+            package(vec![direct, child, sd_credential("other", "vct:other")]),
+        );
+
+        assert_plan(
+            &plan,
+            vec![vec![vec![alt("pid", "child"), alt("pid", "direct")]]],
+        );
+    }
+
+    #[test]
+    fn claims_without_claim_sets_select_all_claims_that_match() {
+        let mut query = sd_query("pid", "vct:pid");
+        query["claims"] = json!([
+            { "id": "given_name", "path": ["given_name"] },
+            { "id": "age_over_18", "path": ["age_over_18"], "values": [true] }
+        ]);
+
+        let plan = plan_ok(
+            json!({ "credentials": [query] }),
+            package(vec![with_claims(
+                sd_credential("sd-pid", "vct:pid"),
+                json!({ "given_name": "Alice", "age_over_18": true }),
+            )]),
+        );
+
+        assert_plan(
+            &plan,
+            vec![vec![vec![alt_claims(
+                "pid",
+                "sd-pid",
+                &["given_name", "age_over_18"],
+            )]]],
+        );
+    }
+
+    #[test]
+    fn claim_sets_select_first_satisfiable_claim_set() {
+        let mut query = sd_query("pid", "vct:pid");
+        query["claims"] = json!([
+            { "id": "family_name", "path": ["family_name"] },
+            { "id": "given_name", "path": ["given_name"] }
+        ]);
+        query["claim_sets"] = json!([["family_name"], ["given_name"]]);
+
+        let plan = plan_ok(
+            json!({ "credentials": [query] }),
+            package(vec![with_claims(
+                sd_credential("sd-pid", "vct:pid"),
+                json!({ "given_name": "Alice" }),
+            )]),
+        );
+
+        assert_plan(
+            &plan,
+            vec![vec![vec![alt_claims("pid", "sd-pid", &["given_name"])]]],
+        );
+    }
+
+    #[test]
+    fn malformed_claim_sets_are_ignored() {
+        let mut query = sd_query("pid", "vct:pid");
+        query["claims"] = json!([{ "id": "given_name", "path": ["given_name"] }]);
+        query["claim_sets"] = json!([["missing"]]);
+
+        let plan = plan_ok(
+            json!({ "credentials": [query] }),
+            package(vec![with_claims(
+                sd_credential("sd-pid", "vct:pid"),
+                json!({ "given_name": "Alice" }),
+            )]),
+        );
+
+        assert_plan(
+            &plan,
+            vec![vec![vec![alt_claims("pid", "sd-pid", &["given_name"])]]],
+        );
+    }
+
+    #[test]
+    fn mdoc_null_path_component_matches_array_elements() {
+        let mut query = mdoc_query("mdl", "org.iso.18013.5.1.mDL");
+        query["claims"] = json!([{
+            "id": "b",
+            "path": ["org.iso.18013.5.1", "driving_privileges", null, "vehicle_category_code"],
+            "values": ["B"]
+        }]);
+
+        let plan = plan_ok(
+            json!({ "credentials": [query] }),
+            package(vec![with_claims(
+                mdoc_credential("mdl-1", "org.iso.18013.5.1.mDL"),
+                json!({
+                    "org.iso.18013.5.1": {
+                        "driving_privileges": [
+                            { "vehicle_category_code": "A" },
+                            { "vehicle_category_code": "B" }
+                        ]
+                    }
+                }),
+            )]),
+        );
+
+        assert_plan(&plan, vec![vec![vec![alt_claims("mdl", "mdl-1", &["b"])]]]);
+    }
+
+    #[test]
+    fn trusted_authorities_require_type_and_value_overlap() {
+        let mut query = sd_query("pid", "vct:pid");
+        query["trusted_authorities"] = json!([{ "type": "aki", "values": ["root-a"] }]);
+
+        let mut trusted = sd_credential("trusted", "vct:pid");
+        trusted["trusted_authorities"] = json!([{ "type": "aki", "values": ["root-a"] }]);
+
+        let mut wrong_type = sd_credential("wrong-type", "vct:pid");
+        wrong_type["trusted_authorities"] = json!([{ "type": "x5c", "values": ["root-a"] }]);
+
+        let mut wrong_value = sd_credential("wrong-value", "vct:pid");
+        wrong_value["trusted_authorities"] = json!([{ "type": "aki", "values": ["root-b"] }]);
+
+        let plan = plan_ok(
+            json!({ "credentials": [query] }),
+            package(vec![trusted, wrong_type, wrong_value]),
+        );
+
+        assert_plan(&plan, vec![vec![vec![alt("pid", "trusted")]]]);
+    }
 }
 
-fn canonicalize_expected_set(set: &[SlotExpectation]) -> String {
-    let mut slot_parts = set
-        .iter()
-        .map(canonicalize_expected_slot)
-        .collect::<Vec<_>>();
-    slot_parts.sort();
-    slot_parts.join("||")
+mod credential_sets {
+    use super::*;
+
+    #[test]
+    fn omitted_credential_sets_request_all_supported_credentials_as_required_slots() {
+        let plan = plan_ok(
+            json!({
+                "credentials": [
+                    sd_query("pid", "vct:pid"),
+                    mdoc_query("mdl", "org.iso.18013.5.1.mDL")
+                ]
+            }),
+            package(vec![
+                sd_credential("sd-pid", "vct:pid"),
+                mdoc_credential("mdl-1", "org.iso.18013.5.1.mDL"),
+            ]),
+        );
+
+        assert_plan(
+            &plan,
+            vec![vec![vec![alt("pid", "sd-pid")], vec![alt("mdl", "mdl-1")]]],
+        );
+    }
+
+    #[test]
+    fn simple_required_set_options_merge_into_one_choice_slot() {
+        let plan = plan_ok(
+            json!({
+                "credentials": [
+                    sd_query("pid_sd", "vct:pid"),
+                    mdoc_query("pid_mdoc", "org.iso.18013.5.1.mDL")
+                ],
+                "credential_sets": [{ "options": [["pid_sd"], ["pid_mdoc"]] }]
+            }),
+            package(vec![
+                sd_credential("sd-pid", "vct:pid"),
+                mdoc_credential("mdl-pid", "org.iso.18013.5.1.mDL"),
+            ]),
+        );
+
+        assert_plan(
+            &plan,
+            vec![vec![vec![
+                alt("pid_sd", "sd-pid"),
+                alt("pid_mdoc", "mdl-pid"),
+            ]]],
+        );
+    }
+
+    #[test]
+    fn optional_set_prefer_absent_exposes_empty_choice_first() {
+        let plan = plan_ok_with_options(
+            json!({
+                "credentials": [
+                    sd_query("sca", "vct:sca"),
+                    sd_query("pid", "vct:pid")
+                ],
+                "credential_sets": [
+                    { "options": [["sca"]] },
+                    { "required": false, "options": [["pid"]] }
+                ]
+            }),
+            package(vec![
+                sd_credential("sca-1", "vct:sca"),
+                sd_credential("pid-1", "vct:pid"),
+            ]),
+            PlanOptions {
+                optional_credential_sets_mode: OptionalCredentialSetsMode::PreferAbsent,
+                ..PlanOptions::default()
+            },
+        );
+
+        assert_plan(
+            &plan,
+            vec![vec![
+                vec![alt("sca", "sca-1")],
+                vec![alt("pid", "pid-1"), none("pid")],
+            ]],
+        );
+    }
+
+    #[test]
+    fn transposable_options_decompose_into_independent_slots() {
+        let plan = plan_ok(
+            json!({
+                "credentials": [
+                    sd_query("sca_card", "vct:sca-card"),
+                    sd_query("pid_1", "vct:pid-1"),
+                    sd_query("pid_2", "vct:pid-2")
+                ],
+                "credential_sets": [{
+                    "options": [
+                        ["sca_card", "pid_1"],
+                        ["sca_card", "pid_2"],
+                        ["sca_card"]
+                    ]
+                }]
+            }),
+            package(vec![
+                sd_credential("card", "vct:sca-card"),
+                sd_credential("pid-1", "vct:pid-1"),
+                sd_credential("pid-2", "vct:pid-2"),
+            ]),
+        );
+
+        assert_plan(
+            &plan,
+            vec![vec![
+                vec![alt("sca_card", "card")],
+                vec![alt("pid_1", "pid-1"), alt("pid_2", "pid-2"), none("pid_1")],
+            ]],
+        );
+    }
 }
 
-fn canonicalize_actual_slot(slot: &dcapi_dcql::SetAlternative<String>) -> String {
-    let mut transaction_data_ids = slot.transaction_data_ids.clone();
-    transaction_data_ids.sort();
-    let mut alt_parts = Vec::new();
-    for selection in &slot.alternatives {
-        if selection.credential_id.is_none() {
-            alt_parts.push("__none__".to_string());
-            continue;
-        }
-        let mut claim_ids = selection
-            .selected_claims
+mod transaction_data {
+    use super::*;
+
+    #[test]
+    fn transaction_data_with_empty_credential_ids_is_ignored() {
+        let plan = plan_ok(
+            json!({
+                "credentials": [sd_query("sca", "vct:sca")],
+                "transaction_data": [{ "type": SCA_PAY_V1, "credential_ids": [] }]
+            }),
+            package(vec![with_transaction_types(
+                sd_credential("sca-1", "vct:sca"),
+                &[SCA_PAY_V1],
+            )]),
+        );
+
+        assert_plan(&plan, vec![vec![vec![alt("sca", "sca-1")]]]);
+    }
+
+    #[test]
+    fn transaction_data_with_unknown_credential_ids_is_ignored() {
+        let plan = plan_ok(
+            json!({
+                "credentials": [sd_query("sca", "vct:sca")],
+                "transaction_data": [{ "type": SCA_PAY_V1, "credential_ids": ["missing"] }]
+            }),
+            package(vec![with_transaction_types(
+                sd_credential("sca-1", "vct:sca"),
+                &[SCA_PAY_V1],
+            )]),
+        );
+
+        assert_plan(&plan, vec![vec![vec![alt("sca", "sca-1")]]]);
+    }
+
+    #[test]
+    fn single_transaction_data_binds_to_the_targeted_slot() {
+        let plan = plan_ok(
+            json!({
+                "credentials": [sd_query("sca", "vct:sca")],
+                "transaction_data": [{ "type": SCA_PAY_V1, "credential_ids": ["sca"] }]
+            }),
+            package(vec![with_transaction_types(
+                sd_credential("sca-1", "vct:sca"),
+                &[SCA_PAY_V1],
+            )]),
+        );
+
+        assert_plan(&plan, vec![vec![vec![alt_tx("sca", "sca-1", &[0])]]]);
+    }
+
+    #[test]
+    fn credentials_without_matching_transaction_type_are_excluded() {
+        let plan = plan_ok(
+            json!({
+                "credentials": [sd_query("sca", "vct:sca")],
+                "transaction_data": [{ "type": SCA_PAY_V1, "credential_ids": ["sca"] }]
+            }),
+            package(vec![
+                with_transaction_types(sd_credential("can-sign", "vct:sca"), &[SCA_PAY_V1]),
+                with_transaction_types(sd_credential("cannot-sign", "vct:sca"), &[OTHER_TD]),
+            ]),
+        );
+
+        assert_plan(&plan, vec![vec![vec![alt_tx("sca", "can-sign", &[0])]]]);
+    }
+
+    #[test]
+    fn first_compatible_transaction_data_wins_per_credential() {
+        let plan = plan_ok(
+            json!({
+                "credentials": [sd_query("sca", "vct:sca")],
+                "transaction_data": [
+                    { "type": SCA_PAY_V2, "credential_ids": ["sca"] },
+                    { "type": SCA_PAY_V1, "credential_ids": ["sca"] }
+                ]
+            }),
+            package(vec![
+                with_transaction_types(
+                    sd_credential("new-card", "vct:sca"),
+                    &[SCA_PAY_V2, SCA_PAY_V1],
+                ),
+                with_transaction_types(sd_credential("old-card", "vct:sca"), &[SCA_PAY_V1]),
+            ]),
+        );
+
+        assert_plan(
+            &plan,
+            vec![vec![vec![
+                alt_tx("sca", "new-card", &[0]),
+                alt_tx("sca", "old-card", &[1]),
+            ]]],
+        );
+    }
+
+    #[test]
+    fn unsupported_newer_entry_falls_back_to_older_compatible_entry() {
+        let plan = plan_ok(
+            json!({
+                "credentials": [sd_query("sca", "vct:sca")],
+                "transaction_data": [
+                    { "type": SCA_PAY_V2, "credential_ids": ["sca"] },
+                    { "type": SCA_PAY_V1, "credential_ids": ["sca"] }
+                ]
+            }),
+            package(vec![with_transaction_types(
+                sd_credential("old-card", "vct:sca"),
+                &[SCA_PAY_V1],
+            )]),
+        );
+
+        assert_plan(&plan, vec![vec![vec![alt_tx("sca", "old-card", &[1])]]]);
+    }
+
+    #[test]
+    fn payload_incompatible_entries_are_skipped_before_fallback() {
+        let plan = plan_ok(
+            json!({
+                "credentials": [sd_query("sca", "vct:sca")],
+                "transaction_data": [
+                    {
+                        "type": SCA_PAY_V2,
+                        "credential_ids": ["sca"],
+                        "payload": { "kind": "new" }
+                    },
+                    {
+                        "type": SCA_PAY_V1,
+                        "credential_ids": ["sca"],
+                        "payload": { "kind": "legacy" }
+                    }
+                ]
+            }),
+            package(vec![with_accepted_payload_kinds(
+                with_transaction_types(
+                    sd_credential("legacy-card", "vct:sca"),
+                    &[SCA_PAY_V2, SCA_PAY_V1],
+                ),
+                &["legacy"],
+            )]),
+        );
+
+        assert_plan(&plan, vec![vec![vec![alt_tx("sca", "legacy-card", &[1])]]]);
+    }
+
+    #[test]
+    fn credentials_without_compatible_transaction_payload_are_excluded() {
+        let err = plan_err(
+            json!({
+                "credentials": [sd_query("sca", "vct:sca")],
+                "transaction_data": [{
+                    "type": SCA_PAY_V1,
+                    "credential_ids": ["sca"],
+                    "payload": { "kind": "new" }
+                }]
+            }),
+            package(vec![with_accepted_payload_kinds(
+                with_transaction_types(sd_credential("legacy-card", "vct:sca"), &[SCA_PAY_V1]),
+                &["legacy"],
+            )]),
+        );
+
+        assert_unsatisfied(err);
+    }
+
+    #[test]
+    fn selected_credential_gets_exactly_one_transaction_data_entry() {
+        let plan = plan_ok(
+            json!({
+                "credentials": [sd_query("sca", "vct:sca")],
+                "transaction_data": [
+                    { "type": SCA_PAY_V1, "credential_ids": ["sca"] },
+                    { "type": SCA_PAY_V1, "credential_ids": ["sca"] }
+                ]
+            }),
+            package(vec![with_transaction_types(
+                sd_credential("sca-1", "vct:sca"),
+                &[SCA_PAY_V1],
+            )]),
+        );
+
+        assert_plan(&plan, vec![vec![vec![alt_tx("sca", "sca-1", &[0])]]]);
+    }
+
+    #[test]
+    fn transaction_data_targeting_non_holder_bound_query_is_ignored() {
+        let plan = plan_ok(
+            json!({
+                "credentials": [sd_query_without_holder_binding("sca", "vct:sca")],
+                "transaction_data": [{ "type": SCA_PAY_V1, "credential_ids": ["sca"] }]
+            }),
+            package(vec![with_transaction_types(
+                sd_credential_without_holder_binding("sca-1", "vct:sca"),
+                &[SCA_PAY_V1],
+            )]),
+        );
+
+        assert_plan(&plan, vec![vec![vec![alt("sca", "sca-1")]]]);
+    }
+}
+
+mod ts12_advanced_profile {
+    use super::*;
+
+    #[test]
+    fn all_sca_transaction_ids_must_appear_in_options_of_the_same_credential_set() {
+        let err = plan_err(
+            json!({
+                "credentials": [
+                    sd_query("sca_card", "vct:sca-card"),
+                    sd_query("sca_account", "vct:sca-account")
+                ],
+                "credential_sets": [
+                    { "options": [["sca_card"]] },
+                    { "options": [["sca_account"]] }
+                ],
+                "transaction_data": [
+                    { "type": SCA_CARD, "credential_ids": ["sca_card"] },
+                    { "type": SCA_ACCOUNT, "credential_ids": ["sca_account"] }
+                ]
+            }),
+            package(vec![
+                with_transaction_types(sd_credential("card", "vct:sca-card"), &[SCA_CARD]),
+                with_transaction_types(sd_credential("account", "vct:sca-account"), &[SCA_ACCOUNT]),
+            ]),
+        );
+
+        assert_invalid_query(err, "same credential set");
+    }
+
+    #[test]
+    fn non_sca_transaction_data_can_target_different_credential_sets() {
+        let plan = plan_ok(
+            json!({
+                "credentials": [
+                    sd_query("receipt", "vct:receipt"),
+                    sd_query("account", "vct:account")
+                ],
+                "credential_sets": [
+                    { "options": [["receipt"]] },
+                    { "options": [["account"]] }
+                ],
+                "transaction_data": [
+                    { "type": OTHER_TD, "credential_ids": ["receipt"] },
+                    { "type": OTHER_ACCOUNT_TD, "credential_ids": ["account"] }
+                ]
+            }),
+            package(vec![
+                with_transaction_types(sd_credential("receipt-1", "vct:receipt"), &[OTHER_TD]),
+                with_transaction_types(
+                    sd_credential("account-1", "vct:account"),
+                    &[OTHER_ACCOUNT_TD],
+                ),
+            ]),
+        );
+
+        assert_plan(
+            &plan,
+            vec![vec![
+                vec![alt_tx("receipt", "receipt-1", &[0])],
+                vec![alt_tx("account", "account-1", &[1])],
+            ]],
+        );
+    }
+
+    #[test]
+    fn non_sca_transaction_data_does_not_trigger_ts12_transposability_rejection() {
+        let plan = plan_ok(
+            json!({
+                "credentials": [
+                    sd_query("receipt", "vct:receipt"),
+                    sd_query("pid_1", "vct:pid-1"),
+                    sd_query("pid_2", "vct:pid-2"),
+                    sd_query("loyalty", "vct:loyalty")
+                ],
+                "credential_sets": [{
+                    "options": [
+                        ["receipt", "pid_1"],
+                        ["receipt", "pid_2", "loyalty"],
+                        ["receipt"]
+                    ]
+                }],
+                "transaction_data": [
+                    { "type": OTHER_TD, "credential_ids": ["receipt"] }
+                ]
+            }),
+            package(vec![
+                with_transaction_types(sd_credential("receipt-1", "vct:receipt"), &[OTHER_TD]),
+                sd_credential("pid-1", "vct:pid-1"),
+                sd_credential("pid-2", "vct:pid-2"),
+                sd_credential("loyalty-1", "vct:loyalty"),
+            ]),
+        );
+
+        assert!(!plan.presentation_sets.is_empty());
+    }
+
+    #[test]
+    fn alternative_with_multiple_sca_entries_for_same_credential_uses_first_match() {
+        let plan = plan_ok(
+            json!({
+                "credentials": [sd_query("sca_card", "vct:sca-card")],
+                "credential_sets": [{ "options": [["sca_card"]] }],
+                "transaction_data": [
+                    { "type": SCA_CARD, "credential_ids": ["sca_card"] },
+                    { "type": SCA_CARD, "credential_ids": ["sca_card"] }
+                ]
+            }),
+            package(vec![with_transaction_types(
+                sd_credential("card", "vct:sca-card"),
+                &[SCA_CARD],
+            )]),
+        );
+
+        assert_plan(&plan, vec![vec![vec![alt_tx("sca_card", "card", &[0])]]]);
+    }
+
+    #[test]
+    fn transposable_sca_options_decompose_into_slots_with_optional_none() {
+        let plan = plan_ok(
+            json!({
+                "credentials": [
+                    sd_query("sca_card", "vct:sca-card"),
+                    sd_query("pid_1", "vct:pid-1"),
+                    sd_query("pid_2", "vct:pid-2")
+                ],
+                "credential_sets": [{
+                    "options": [
+                        ["sca_card", "pid_1"],
+                        ["sca_card", "pid_2"],
+                        ["sca_card"]
+                    ]
+                }],
+                "transaction_data": [
+                    { "type": SCA_CARD, "credential_ids": ["sca_card"] }
+                ]
+            }),
+            package(vec![
+                with_transaction_types(sd_credential("card", "vct:sca-card"), &[SCA_CARD]),
+                sd_credential("pid-1", "vct:pid-1"),
+                sd_credential("pid-2", "vct:pid-2"),
+            ]),
+        );
+
+        assert_plan(
+            &plan,
+            vec![vec![
+                vec![alt_tx("sca_card", "card", &[0])],
+                vec![alt("pid_1", "pid-1"), alt("pid_2", "pid-2"), none("pid_1")],
+            ]],
+        );
+    }
+
+    #[test]
+    fn non_transposable_sca_options_are_invalid() {
+        let err = plan_err(
+            json!({
+                "credentials": [
+                    sd_query("sca_card", "vct:sca-card"),
+                    sd_query("pid_1", "vct:pid-1"),
+                    sd_query("pid_2", "vct:pid-2"),
+                    sd_query("loyalty", "vct:loyalty")
+                ],
+                "credential_sets": [{
+                    "options": [
+                        ["sca_card", "pid_1"],
+                        ["sca_card", "pid_2", "loyalty"],
+                        ["sca_card"]
+                    ]
+                }],
+                "transaction_data": [
+                    { "type": SCA_CARD, "credential_ids": ["sca_card"] }
+                ]
+            }),
+            package(vec![
+                with_transaction_types(sd_credential("card", "vct:sca-card"), &[SCA_CARD]),
+                sd_credential("pid-1", "vct:pid-1"),
+                sd_credential("pid-2", "vct:pid-2"),
+                sd_credential("loyalty-1", "vct:loyalty"),
+            ]),
+        );
+
+        assert_invalid_query(err, "not transposable");
+    }
+
+    #[test]
+    fn different_sca_options_keep_their_own_transaction_data_binding() {
+        let plan = plan_ok(
+            json!({
+                "credentials": [
+                    sd_query("sca_card", "vct:sca-card"),
+                    sd_query("sca_account", "vct:sca-account"),
+                    sd_query("pid", "vct:pid")
+                ],
+                "credential_sets": [{
+                    "options": [
+                        ["sca_card", "pid"],
+                        ["sca_account", "pid"]
+                    ]
+                }],
+                "transaction_data": [
+                    { "type": SCA_CARD, "credential_ids": ["sca_card"] },
+                    { "type": SCA_ACCOUNT, "credential_ids": ["sca_account"] }
+                ]
+            }),
+            package(vec![
+                with_transaction_types(sd_credential("card", "vct:sca-card"), &[SCA_CARD]),
+                with_transaction_types(sd_credential("account", "vct:sca-account"), &[SCA_ACCOUNT]),
+                sd_credential("pid-1", "vct:pid"),
+            ]),
+        );
+
+        assert_plan(
+            &plan,
+            vec![vec![
+                vec![
+                    alt_tx("sca_card", "card", &[0]),
+                    alt_tx("sca_account", "account", &[1]),
+                ],
+                vec![alt("pid", "pid-1")],
+            ]],
+        );
+    }
+
+    #[test]
+    fn slot_display_order_and_default_follow_first_alternative() {
+        let plan = plan_ok(
+            json!({
+                "credentials": [
+                    sd_query("pid_2", "vct:pid-2"),
+                    sd_query("sca_card", "vct:sca-card"),
+                    sd_query("pid_1", "vct:pid-1")
+                ],
+                "credential_sets": [{
+                    "options": [
+                        ["sca_card", "pid_1"],
+                        ["sca_card", "pid_2"],
+                        ["sca_card"]
+                    ]
+                }],
+                "transaction_data": [
+                    { "type": SCA_CARD, "credential_ids": ["sca_card"] }
+                ]
+            }),
+            package(vec![
+                sd_credential("pid-2", "vct:pid-2"),
+                with_transaction_types(sd_credential("card", "vct:sca-card"), &[SCA_CARD]),
+                sd_credential("pid-1", "vct:pid-1"),
+            ]),
+        );
+
+        let pid_slot = plan
+            .presentation_sets
+            .first()
+            .expect("one presentation set")
             .iter()
-            .filter_map(|claim| claim.id.clone())
+            .find(|slot| {
+                slot.alternatives
+                    .iter()
+                    .any(|selection| selection.dcql_id == "pid_1" || selection.dcql_id == "pid_2")
+            })
+            .expect("pid slot");
+
+        let ordered = pid_slot
+            .alternatives
+            .iter()
+            .map(|selection| {
+                (
+                    selection.dcql_id.as_str(),
+                    selection.credential_id.as_deref(),
+                )
+            })
             .collect::<Vec<_>>();
-        claim_ids.sort();
-        let cred_id = selection.credential_id.as_ref().unwrap();
-        alt_parts.push(format!(
-            "{}:{}:claims=[{}]",
-            selection.dcql_id,
-            cred_id,
-            claim_ids.join(",")
-        ));
-    }
-    alt_parts.sort();
-    format!(
-        "tx=[{}];alts=[{}]",
-        join_indices(&transaction_data_ids),
-        alt_parts.join("|")
-    )
-}
 
-fn canonicalize_expected_slot(slot: &SlotExpectation) -> String {
-    let mut transaction_data_ids = slot.transaction_data_ids.clone();
-    transaction_data_ids.sort();
-    let mut alt_parts = Vec::new();
-    for selection in &slot.alternatives {
-        if selection.credential_id.is_none() {
-            alt_parts.push("__none__".to_string());
-            continue;
-        }
-        let mut claim_ids = selection.selected_claim_ids.clone();
-        claim_ids.sort();
-        let cred_id = selection.credential_id.as_ref().unwrap();
-        alt_parts.push(format!(
-            "{}:{}:claims=[{}]",
-            selection.dcql_id,
-            cred_id,
-            claim_ids.join(",")
-        ));
+        assert_eq!(
+            ordered,
+            vec![
+                ("pid_1", Some("pid-1")),
+                ("pid_2", Some("pid-2")),
+                ("pid_1", None)
+            ]
+        );
     }
-    alt_parts.sort();
-    format!(
-        "tx=[{}];alts=[{}]",
-        join_indices(&transaction_data_ids),
-        alt_parts.join("|")
-    )
-}
-
-fn join_indices(indices: &[usize]) -> String {
-    indices
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(",")
 }

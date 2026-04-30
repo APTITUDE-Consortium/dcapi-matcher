@@ -1,9 +1,0 @@
-{
-  "credentials": [
-    {
-      "id": "x",
-      "format": "jwt_vc_json",
-      "meta": { "foo": "bar" }
-    }
-  ]
-}

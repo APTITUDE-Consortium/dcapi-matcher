@@ -1,7 +1,6 @@
-use crate::profile::ProfileError;
+use crate::models::Ts12DataType;
 use alloc::string::String;
 use core::error::Error as CoreError;
-use crate::models::Ts12DataType;
 use dcapi_dcql::ClaimsPathPointer;
 use thiserror::Error;
 
@@ -20,7 +19,7 @@ pub enum Ts12Error {
     },
 }
 
-/// TS12 metadata validation errors (credential package warnings).
+/// TS12 metadata shape errors (credential package warnings).
 #[derive(Debug, Error)]
 pub enum Ts12MetadataError {
     /// Missing metadata entry for a required transaction data type.
@@ -117,12 +116,6 @@ pub enum TransactionDataDecodeError {
     /// Missing credential ids.
     #[error("transaction_data[{index}] credential_ids must be non-empty")]
     MissingCredentialIds { index: usize },
-    /// Unknown credential id.
-    #[error("transaction_data[{index}] unknown credential_id: {credential_id}")]
-    UnknownCredentialId { index: usize, credential_id: String },
-    /// Holder binding requirement failed.
-    #[error("transaction_data[{index}] requires holder binding: {credential_id}")]
-    HolderBindingRequired { index: usize, credential_id: String },
 }
 
 /// Request data decoding error.
@@ -167,20 +160,6 @@ pub enum OpenId4VpError {
     /// Signed request origin mismatch.
     #[error("signed openid4vp request origin mismatch for {protocol}: {origin}")]
     OriginMismatch { protocol: String, origin: String },
-    /// Request object handling is not supported.
-    #[error("openid4vp request object is not supported for {protocol}")]
-    RequestObjectUnsupported { protocol: String },
-    /// DCQL via `scope` is not supported.
-    #[error("dcql query via scope is not supported")]
-    DcqlScopeUnsupported,
-    /// Transaction data cannot be satisfied by the DCQL query.
-    #[error(
-        "transaction_data[{index}] has no matching credential in dcql_query: {credential_ids:?}"
-    )]
-    TransactionDataUnsatisfied {
-        index: usize,
-        credential_ids: Vec<String>,
-    },
 }
 
 /// Credential package decoding errors.
@@ -219,9 +198,6 @@ pub enum MatcherError {
     /// DCQL planning failed.
     #[error("dcql planning error")]
     Dcql(#[from] dcapi_dcql::PlanError),
-    /// DCQL profile validation failed.
-    #[error("dcql profile error")]
-    Profile(#[from] ProfileError),
     /// Credential package decoding failed.
     #[error("credential package decode error")]
     CredentialPackageDecode(#[from] CredentialPackageError),

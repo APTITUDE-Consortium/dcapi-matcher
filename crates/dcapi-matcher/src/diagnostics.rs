@@ -169,10 +169,8 @@ pub fn flush_and_apply() {
     let set = CredentialSet::new_cow(set_id).add_entries(entries.iter().map(|entry| {
         let id = next_id();
         let cred_id = cow_cstr_from_c8string(c8format!("{prefix}:log:{id}"));
-        let mut cred = StringIdEntry::new_cow(
-            cred_id,
-            Cow::Borrowed(entry.level.as_c8str().as_c_str()),
-        );
+        let mut cred =
+            StringIdEntry::new_cow(cred_id, Cow::Borrowed(entry.level.as_c8str().as_c_str()));
         if !entry.message.is_empty() {
             cred.disclaimer = Some(cow_cstr_from_bytes(entry.message.as_bytes()));
         }

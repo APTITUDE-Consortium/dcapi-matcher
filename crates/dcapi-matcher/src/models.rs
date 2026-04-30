@@ -2,7 +2,8 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use dcapi_dcql::DcqlQuery;
-use serde::{Deserialize, Serialize};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 /// Protocol identifier for OpenID4VP requests in DC API.
@@ -155,16 +156,21 @@ impl RequestData {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct OpenId4VpRequest {
     /// Response type parameter.
+    #[serde(default, deserialize_with = "deserialize_optional_valid")]
     pub response_type: Option<String>,
     /// Response mode parameter.
+    #[serde(default, deserialize_with = "deserialize_optional_valid")]
     pub response_mode: Option<String>,
     /// Nonce parameter for replay protection.
+    #[serde(default, deserialize_with = "deserialize_optional_valid")]
     pub nonce: Option<String>,
     /// Verifier client metadata (OpenID4VP).
     pub client_metadata: Option<Value>,
     /// DCQL query request.
+    #[serde(default, deserialize_with = "deserialize_optional_valid")]
     pub dcql_query: Option<DcqlQuery>,
     /// Transaction data constraints as defined by OpenID4VP.
+    #[serde(default, deserialize_with = "deserialize_transaction_data_inputs")]
     pub transaction_data: Option<Vec<TransactionDataInput>>,
     /// Verifier info object (OpenID4VP).
     pub verifier_info: Option<Value>,
@@ -183,4 +189,35 @@ pub enum TransactionDataInput {
     Encoded(String),
     /// Decoded JSON object.
     Decoded(Box<dcapi_dcql::TransactionData>),
+}
+
+fn deserialize_optional_valid<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: DeserializeOwned,
+{
+    let Some(value) = Option::<Value>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    Ok(serde_json::from_value(value).ok())
+}
+
+fn deserialize_transaction_data_inputs<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<TransactionDataInput>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(value) = Option::<Value>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    let Some(items) = value.as_array() else {
+        return Ok(None);
+    };
+    Ok(Some(
+        items
+            .iter()
+            .filter_map(|item| serde_json::from_value(item.clone()).ok())
+            .collect(),
+    ))
 }

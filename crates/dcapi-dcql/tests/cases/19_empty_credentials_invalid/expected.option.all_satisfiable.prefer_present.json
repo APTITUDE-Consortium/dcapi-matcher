@@ -1,5 +1,0 @@
-{
-  "result": "error",
-  "error": "InvalidQuery",
-  "message": "dcql_query.credentials must contain at least one credential query"
-}

@@ -1,9 +1,0 @@
-{
-  "credentials": [
-    {
-      "id": "pid",
-      "format": "dc+sd-jwt",
-      "meta": { "doctype_value": "org.example.NOT_A_VCT" }
-    }
-  ]
-}

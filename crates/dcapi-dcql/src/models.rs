@@ -1,17 +1,81 @@
 use crate::CredentialFormat;
 use crate::path::ClaimsPathPointer;
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
-use serdev::{Deserialize, Serialize};
+use std::ops::Deref;
+
+/// Vec wrapper that can only be built with at least one item.
+#[derive(Debug, Clone)]
+pub struct NonEmptyVec<T>(Vec<T>);
+
+impl<T> NonEmptyVec<T> {
+    pub fn try_new(values: Vec<T>, empty_error: &'static str) -> Result<Self, String> {
+        if values.is_empty() {
+            return Err(empty_error.to_string());
+        }
+        Ok(Self(values))
+    }
+
+    pub fn as_slice(&self) -> &[T] {
+        &self.0
+    }
+}
+
+impl<T> Deref for NonEmptyVec<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl<'a, T> IntoIterator for &'a NonEmptyVec<T> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl<T> Serialize for NonEmptyVec<T>
+where
+    T: Serialize,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de, T> Deserialize<'de> for NonEmptyVec<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let values = Vec::<T>::deserialize(deserializer)?;
+        Self::try_new(
+            values,
+            "dcql_query.credentials must contain at least one credential query",
+        )
+        .map_err(D::Error::custom)
+    }
+}
 
 /// Core DCQL object from OpenID4VP.
 ///
 /// It intentionally models only DCQL members. `transaction_data` belongs to the
 /// enclosing Authorization Request and is therefore passed separately to the planner.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(validate = "validate_dcql_query")]
 pub struct DcqlQuery {
     /// Requested Credential Queries.
-    pub credentials: Vec<CredentialQuery>,
+    pub credentials: NonEmptyVec<CredentialQuery>,
     /// Optional combinations constraining which credential query ids can be returned together.
     pub credential_sets: Option<Vec<CredentialSetQuery>>,
 }
@@ -19,8 +83,7 @@ pub struct DcqlQuery {
 /// One credential request entry.
 ///
 /// The enum is keyed by `format` to keep the query strongly typed per credential format.
-/// Unknown formats are retained at parse time and rejected during validation so deserialization
-/// remains forward-compatible.
+/// Unknown formats are retained at parse time so unsupported query parts can be pruned.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "format")]
 pub enum CredentialQuery {
@@ -72,7 +135,6 @@ pub struct SdJwtMeta {
 
 /// Format-agnostic Credential Query members.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(validate = "validate_credential_query_common")]
 pub struct CredentialQueryCommon {
     pub id: String,
     pub multiple: Option<bool>,
@@ -189,7 +251,6 @@ impl ClaimsQuery {
 
 /// Credential set constraint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(validate = "validate_credential_set_query")]
 pub struct CredentialSetQuery {
     /// Alternative required-id combinations.
     pub options: Vec<Vec<String>>,
@@ -198,27 +259,6 @@ pub struct CredentialSetQuery {
     pub required: bool,
     /// Optional verifier purpose string/object forwarded as-is.
     pub purpose: Option<Value>,
-}
-
-fn validate_dcql_query(value: &DcqlQuery) -> Result<(), String> {
-    if value.credentials.is_empty() {
-        return Err(
-            "dcql_query.credentials must contain at least one credential query".to_string(),
-        );
-    }
-    Ok(())
-}
-
-fn validate_credential_query_common(_value: &CredentialQueryCommon) -> Result<(), String> {
-    // Lenient: claim_sets without claims, claims missing id, and empty
-    // claim paths are handled gracefully by the planner rather than
-    // rejected at parse time.
-    Ok(())
-}
-
-fn validate_credential_set_query(_value: &CredentialSetQuery) -> Result<(), String> {
-    // Lenient: empty options are filtered out by the planner.
-    Ok(())
 }
 
 /// Default value for `CredentialSetQuery::required`.

@@ -1,9 +1,0 @@
-{
-  "credentials": [
-    { "id": "a", "format": "dc+sd-jwt", "meta": { "vct_values": ["vct:a"] } }
-  ],
-  "credential_sets": [
-    { "options": [["a"]], "required": true },
-    { "options": [["a"]], "required": false }
-  ]
-}

@@ -1,19 +1,19 @@
-use android_credman::{get_request_string, CredmanRender};
+use android_credman::{CredmanRender, get_request_string};
 use base64::Engine;
 use c8str::{C8Str, C8String, c8, c8format};
 use dcapi_dcql::{
     ClaimValue, ClaimsPathPointer, CredentialFormat, CredentialStore, PathElement, PlanOptions,
     TransactionData, TransactionDataType, ValueMatch, path_matches,
 };
+use dcapi_matcher::diagnostics::info;
 use dcapi_matcher::{
-    DefaultProfile, LogLevel, MatcherOptions, MatcherStore, OpenId4VpConfig, Ts12ClaimMetadata,
-    Ts12DataType, Ts12LocalizedLabel, Ts12LocalizedValue, Ts12PaymentSummary,
-    Ts12TransactionMetadata, Ts12UiLabels, dcapi_matcher, match_dc_api_request,
+    LogLevel, MatcherOptions, MatcherStore, OpenId4VpConfig, Ts12ClaimMetadata, Ts12DataType,
+    Ts12LocalizedLabel, Ts12LocalizedValue, Ts12PaymentSummary, Ts12TransactionMetadata,
+    Ts12UiLabels, dcapi_matcher, match_dc_api_request,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use std::borrow::Cow;
-use dcapi_matcher::diagnostics::info;
 
 #[repr(transparent)]
 #[derive(Debug, Clone)]
@@ -274,7 +274,7 @@ impl PackageStore {
     }
 
     fn dcql_options(&self) -> PlanOptions {
-        self.dcql
+        self.dcql.clone()
     }
 }
 
@@ -340,8 +340,7 @@ impl CredentialStore for PackageStore {
         }
 
         let requires_subtype = credential.ts12_metadata.iter().any(|meta| {
-            meta.data_type.r#type == transaction_data.r#type
-                && meta.data_type.subtype.is_some()
+            meta.data_type.r#type == transaction_data.r#type && meta.data_type.subtype.is_some()
         });
         if !requires_subtype {
             return true;
@@ -489,7 +488,7 @@ impl MatcherStore for PackageStore {
     }
 
     fn openid4vp_config(&self) -> OpenId4VpConfig {
-        self.openid4vp
+        self.openid4vp.clone()
     }
 
     fn locales(&self) -> &[&str] {
@@ -775,7 +774,7 @@ fn matcher_entrypoint(store: PackageStore) {
     let options = MatcherOptions {
         dcql: store.dcql_options(),
     };
-    let Ok(matched) = match_dc_api_request(&store, &options, &DefaultProfile) else {
+    let Ok(matched) = match_dc_api_request(&store, &options) else {
         return;
     };
     matched.render();
@@ -793,7 +792,7 @@ mod tests {
     static REQUEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn package_payload() -> &'static str {
-        r#"{"default_id_prefix":"cred-","openid4vp":{"enabled":true,"allow_dcql":true,"allow_transaction_data":true,"allow_signed_requests":true,"allow_response_mode_jwt":true},"dcql":{"credential_set_option_mode":"first_satisfiable_only","optional_credential_sets_mode":"prefer_present"},"credentials":[{"id":"mdoc-1","format":"mso_mdoc","title":"Drivers License","subtitle":"Issued by Utopia","icon":"/9j/4AAQSkZJRgABAQEASABIAAD//gATQ3JlYXRlZCB3aXRoIEdJTVD/2wBDAAMCAgMCAgMDAwMEAwMEBQgFBQQEBQoHBwYIDAoMDAsKCwsNDhIQDQ4RDgsLEBYQERMUFRUVDA8XGBYUGBIUFRT/2wBDAQMEBAUEBQkFBQkUDQsNFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBT/wgARCABLAGQDAREAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAf/xAAWAQEBAQAAAAAAAAAAAAAAAAAABgj/2gAMAwEAAhADEAAAAZzC6pAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAH/xAAUEAEAAAAAAAAAAAAAAAAAAABw/9oACAEBAAEFAgL/xAAUEQEAAAAAAAAAAAAAAAAAAABw/9oACAEDAQE/AQL/xAAUEQEAAAAAAAAAAAAAAAAAAABw/9oACAECAQE/AQL/xAAUEAEAAAAAAAAAAAAAAAAAAABw/9oACAEBAAY/AgL/xAAUEAEAAAAAAAAAAAAAAAAAAABw/9oACAEBAAE/IQL/2gAMAwEAAgADAAAAEP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/8QAFBEBAAAAAAAAAAAAAAAAAAAAcP/aAAgBAwEBPxAC/8QAFBEBAAAAAAAAAAAAAAAAAAAAcP/aAAgBAgEBPxAC/8QAFBABAAAAAAAAAAAAAAAAAAAAcP/aAAgBAQABPxAC/9k=","doctype":"org.iso.18013.5.1.mDL","fields":[{"path":["org.iso.18013.5.1","family_name"],"display_name":"Family Name"},{"path":["org.iso.18013.5.1","given_name"],"display_name":"Given Name"}],"claims":{"org.iso.18013.5.1":{"family_name":"Glastra","given_name":"Timo"}}},{"id":"pid-1","format":"dc+sd-jwt","title":"PID","subtitle":"Issued by Utopia","icon":"/9j/4AAQSkZJRgABAQEASABIAAD//gATQ3JlYXRlZCB3aXRoIEdJTVD/2wBDAAMCAgMCAgMDAwMEAwMEBQgFBQQEBQoHBwYIDAoMDAsKCwsNDhIQDQ4RDgsLEBYQERMUFRUVDA8XGBYUGBIUFRT/2wBDAQMEBAUEBQkFBQkUDQsNFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBT/wgARCABLAGQDAREAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAf/xAAWAQEBAQAAAAAAAAAAAAAAAAAABgj/2gAMAwEAAhADEAAAAZzC6pAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAH/xAAUEAEAAAAAAAAAAAAAAAAAAABw/9oACAEBAAEFAgL/xAAUEQEAAAAAAAAAAAAAAAAAAABw/9oACAEDAQE/AQL/xAAUEQEAAAAAAAAAAAAAAAAAAABw/9oACAECAQE/AQL/xAAUEAEAAAAAAAAAAAAAAAAAAABw/9oACAEBAAY/AgL/xAAUEAEAAAAAAAAAAAAAAAAAAABw/9oACAEBAAE/IQL/2gAMAwEAAgADAAAAEP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/8QAFBEBAAAAAAAAAAAAAAAAAAAAcP/aAAgBAwEBPxAC/8QAFBEBAAAAAAAAAAAAAAAAAAAAcP/aAAgBAgEBPxAC/8QAFBABAAAAAAAAAAAAAAAAAAAAcP/aAAgBAQABPxAC/9k=","vcts":["eu.europa.ec.eudi.pid.1"],"claims":{"first_name":"Timo","address":{"city":"Somewhere"}}}],"log_level":"debug"}"#
+        r#"{"default_id_prefix":"cred-","openid4vp":{"enabled":true,"supported_request_protocols":["openid4vp-v1-unsigned","openid4vp-v1-signed","openid4vp-v1-multisigned"],"supported_response_modes":["dc_api","dc_api.jwt"],"supported_response_types":["vp_token"],"supported_query_methods":["dcql_query"],"supported_request_parameters":["transaction_data"]},"dcql":{"credential_set_option_mode":"first_satisfiable_only","optional_credential_sets_mode":"prefer_present"},"credentials":[{"id":"mdoc-1","format":"mso_mdoc","title":"Drivers License","subtitle":"Issued by Utopia","icon":"/9j/4AAQSkZJRgABAQEASABIAAD//gATQ3JlYXRlZCB3aXRoIEdJTVD/2wBDAAMCAgMCAgMDAwMEAwMEBQgFBQQEBQoHBwYIDAoMDAsKCwsNDhIQDQ4RDgsLEBYQERMUFRUVDA8XGBYUGBIUFRT/2wBDAQMEBAUEBQkFBQkUDQsNFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBT/wgARCABLAGQDAREAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAf/xAAWAQEBAQAAAAAAAAAAAAAAAAAABgj/2gAMAwEAAhADEAAAAZzC6pAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAH/xAAUEAEAAAAAAAAAAAAAAAAAAABw/9oACAEBAAEFAgL/xAAUEQEAAAAAAAAAAAAAAAAAAABw/9oACAEDAQE/AQL/xAAUEQEAAAAAAAAAAAAAAAAAAABw/9oACAECAQE/AQL/xAAUEAEAAAAAAAAAAAAAAAAAAABw/9oACAEBAAY/AgL/xAAUEAEAAAAAAAAAAAAAAAAAAABw/9oACAEBAAE/IQL/2gAMAwEAAgADAAAAEP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/8QAFBEBAAAAAAAAAAAAAAAAAAAAcP/aAAgBAwEBPxAC/8QAFBEBAAAAAAAAAAAAAAAAAAAAcP/aAAgBAgEBPxAC/8QAFBABAAAAAAAAAAAAAAAAAAAAcP/aAAgBAQABPxAC/9k=","doctype":"org.iso.18013.5.1.mDL","fields":[{"path":["org.iso.18013.5.1","family_name"],"display_name":"Family Name"},{"path":["org.iso.18013.5.1","given_name"],"display_name":"Given Name"}],"claims":{"org.iso.18013.5.1":{"family_name":"Glastra","given_name":"Timo"}}},{"id":"pid-1","format":"dc+sd-jwt","title":"PID","subtitle":"Issued by Utopia","icon":"/9j/4AAQSkZJRgABAQEASABIAAD//gATQ3JlYXRlZCB3aXRoIEdJTVD/2wBDAAMCAgMCAgMDAwMEAwMEBQgFBQQEBQoHBwYIDAoMDAsKCwsNDhIQDQ4RDgsLEBYQERMUFRUVDA8XGBYUGBIUFRT/2wBDAQMEBAUEBQkFBQkUDQsNFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBT/wgARCABLAGQDAREAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAf/xAAWAQEBAQAAAAAAAAAAAAAAAAAABgj/2gAMAwEAAhADEAAAAZzC6pAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAH/xAAUEAEAAAAAAAAAAAAAAAAAAABw/9oACAEBAAEFAgL/xAAUEQEAAAAAAAAAAAAAAAAAAABw/9oACAEDAQE/AQL/xAAUEQEAAAAAAAAAAAAAAAAAAABw/9oACAECAQE/AQL/xAAUEAEAAAAAAAAAAAAAAAAAAABw/9oACAEBAAY/AgL/xAAUEAEAAAAAAAAAAAAAAAAAAABw/9oACAEBAAE/IQL/2gAMAwEAAgADAAAAEP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/wD/AP8A/8QAFBEBAAAAAAAAAAAAAAAAAAAAcP/aAAgBAwEBPxAC/8QAFBEBAAAAAAAAAAAAAAAAAAAAcP/aAAgBAgEBPxAC/8QAFBABAAAAAAAAAAAAAAAAAAAAcP/aAAgBAQABPxAC/9k=","vcts":["eu.europa.ec.eudi.pid.1"],"claims":{"first_name":"Timo","address":{"city":"Somewhere"}}}],"log_level":"debug"}"#
     }
 
     #[test]
@@ -803,15 +802,26 @@ mod tests {
 
         assert_eq!(store.credentials.len(), 2);
         assert_eq!(store.credentials[0].id.as_c8_str().as_str(), "mdoc-1");
-        assert_eq!(store.credentials[0].doctype.as_deref(), Some("org.iso.18013.5.1.mDL"));
+        assert_eq!(
+            store.credentials[0].doctype.as_deref(),
+            Some("org.iso.18013.5.1.mDL")
+        );
         assert_eq!(store.credentials[0].fields.len(), 2);
         assert_eq!(store.credentials[1].id.as_c8_str().as_str(), "pid-1");
-        assert_eq!(store.credentials[1].vcts, vec!["eu.europa.ec.eudi.pid.1".to_string()]);
+        assert_eq!(
+            store.credentials[1].vcts,
+            vec!["eu.europa.ec.eudi.pid.1".to_string()]
+        );
         assert!(matches!(store.log_level, Some(LogLevel::Debug)));
-        assert_eq!(store.dcql.credential_set_option_mode, CredentialSetOptionMode::FirstSatisfiableOnly);
-        assert_eq!(store.dcql.optional_credential_sets_mode, OptionalCredentialSetsMode::PreferPresent);
+        assert_eq!(
+            store.dcql.credential_set_option_mode,
+            CredentialSetOptionMode::FirstSatisfiableOnly
+        );
+        assert_eq!(
+            store.dcql.optional_credential_sets_mode,
+            OptionalCredentialSetsMode::PreferPresent
+        );
     }
-
 
     #[test]
     fn matches_mdl_claims_for_dcql_request() {
@@ -855,8 +865,7 @@ mod tests {
         let options = MatcherOptions {
             dcql: store.dcql_options(),
         };
-        let response =
-            match_dc_api_request(&store, &options, &DefaultProfile).expect("match should succeed");
+        let response = match_dc_api_request(&store, &options).expect("match should succeed");
         assert!(!response.results.is_empty());
 
         let set = match &response.results[0] {

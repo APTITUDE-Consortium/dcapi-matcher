@@ -7,7 +7,6 @@ pub mod diagnostics;
 mod engine;
 mod error;
 mod models;
-mod profile;
 mod traits;
 mod ts12;
 
@@ -15,7 +14,10 @@ pub use android_credman::{
     CredentialEntry, CredentialSet, CredentialSlot, Field, InlineIssuanceEntry, MatcherResponse,
     MatcherResult, PaymentEntry, StringIdEntry,
 };
-pub use config::OpenId4VpConfig;
+pub use config::{
+    OpenId4VpConfig, QUERY_METHOD_DCQL_QUERY, REQUEST_PARAMETER_TRANSACTION_DATA,
+    RESPONSE_MODE_DC_API, RESPONSE_MODE_DC_API_JWT, RESPONSE_TYPE_VP_TOKEN,
+};
 pub use dcapi_matcher_macros::dcapi_matcher;
 pub use diagnostics::LogLevel;
 pub use engine::{MatcherOptions, decode_request_data, match_dc_api_request};
@@ -24,7 +26,6 @@ pub use error::{
     Ts12MetadataError,
 };
 pub use models::*;
-pub use profile::{DefaultProfile, HaipProfile, HaipProfileError, Profile, ProfileError};
 pub use traits::*;
 pub use ts12::{
     Ts12ClaimMetadata, Ts12LocalizedLabel, Ts12LocalizedValue, Ts12PaymentSummary,

@@ -89,20 +89,28 @@ struct Ts12TransactionDisplay {
     fields: Vec<Ts12RenderedField>,
 }
 
-/// Validates one transaction-data entry against TS12 structural requirements.
-pub(crate) fn validate_ts12_transaction_data(
-    index: usize,
-    transaction_data: &TransactionData,
-) -> Result<(), Ts12Error> {
-    let Some(payload) = transaction_data_payload(transaction_data) else {
-        return Ok(());
-    };
+/// TS12 transaction-data shape accepted by the matcher.
+pub(crate) struct Ts12TransactionDataShape<'a> {
+    _payload: Option<&'a Value>,
+}
 
-    let Value::Object(_) = payload else {
-        return Err(Ts12Error::PayloadNotObject { index });
-    };
+impl<'a> Ts12TransactionDataShape<'a> {
+    pub(crate) fn build(
+        index: usize,
+        transaction_data: &'a TransactionData,
+    ) -> Result<Self, Ts12Error> {
+        let Some(payload) = transaction_data_payload(transaction_data) else {
+            return Ok(Self { _payload: None });
+        };
 
-    Ok(())
+        let Value::Object(_) = payload else {
+            return Err(Ts12Error::PayloadNotObject { index });
+        };
+
+        Ok(Self {
+            _payload: Some(payload),
+        })
+    }
 }
 
 fn transaction_data_payload(transaction_data: &TransactionData) -> Option<&Value> {

@@ -143,12 +143,12 @@ let plan = plan_selection(&query, transaction_data.as_deref(), &store, &PlanOpti
 for (set_idx, set) in plan.presentation_sets.iter().enumerate() {
     println!("presentation set #{set_idx}");
     for slot in set {
-        println!("  tx data indices: {:?}", slot.transaction_data_ids);
         for selection in &slot.alternatives {
             let cred_id = selection
                 .credential_id
                 .as_deref()
                 .unwrap_or("<none>");
+            println!("  tx data indices: {:?}", selection.transaction_data_ids);
             println!("  selection dcql_id={} credential_id={}", selection.dcql_id, cred_id);
         }
     }
