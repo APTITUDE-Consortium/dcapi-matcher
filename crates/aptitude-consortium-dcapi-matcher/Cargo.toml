@@ -1,6 +1,7 @@
 [package]
 name = "aptitude-consortium-dcapi-matcher"
 version = "0.1.0"
+license = "MIT"
 edition = "2024"
 publish = false
 
